@@ -1,9 +1,8 @@
 import os
 import re
 import shutil
-import zipfile
-import requests
 import subprocess
+import requests
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
 
@@ -26,7 +25,8 @@ CRF = os.getenv('CRF', '32')
 PRESET = os.getenv('PRESET', '10')
 
 FPS = 30
-TRANSITION = min(0.3, DURATION * 0.4) if DURATION > 0.4 else 0
+# Disable transitions for fast slideshows (3img/sec) to prevent lag/blur
+TRANSITION = min(0.3, DURATION * 0.4) if DURATION > 0.5 else 0
 
 RES_MAP = {
     'Landscape (1920x1080)': (1920, 1080),
@@ -39,7 +39,6 @@ def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
 def create_blurred_bg(pil_img):
-    """Aspect Fill & Blur background logic."""
     img = pil_img.convert('RGB')
     scale = max(CANVAS_W / img.width, CANVAS_H / img.height)
     new_w, new_h = int(img.width * scale), int(img.height * scale)
@@ -50,7 +49,6 @@ def create_blurred_bg(pil_img):
     return np.array(ImageEnhance.Brightness(img).enhance(0.4))
 
 def process_media(filepath):
-    """Standardizes any media type to the common canvas."""
     try:
         ext = os.path.splitext(filepath)[1].lower()
         is_video = ext in ['.mp4', '.mov', '.gif', '.webm', '.webp']
@@ -60,7 +58,6 @@ def process_media(filepath):
             if ext in ['.gif', '.webp']: clip = clip.without_audio()
             if clip.duration < DURATION:
                 clip = clip.loop(duration=DURATION)
-            # Use first frame for BG
             temp_f = f"{filepath}_t.jpg"
             clip.save_frame(temp_f, t=0)
             with Image.open(temp_f) as thumb: bg_arr = create_blurred_bg(thumb)
@@ -75,33 +72,42 @@ def process_media(filepath):
         scale = min(CANVAS_W / clip.w, CANVAS_H / clip.h)
         fg_clip = clip.resize(scale).set_position("center")
         
-        # Subtle Ken Burns for static images
+        # Subtle Zoom for static images (only if slow)
         if not is_video and DURATION > 1.0:
             fg_clip = fg_clip.resize(lambda t: 1 + 0.03 * (t / DURATION))
 
         return CompositeVideoClip([bg_clip, fg_clip], size=(CANVAS_W, CANVAS_H)).set_fps(FPS)
     except Exception as e:
-        print(f"Error {filepath}: {e}")
+        print(f"Skipping {filepath}: {e}")
         return None
 
 def main():
-    os.makedirs("workspace/extracted", exist_ok=True)
+    extract_path = "workspace/extracted"
+    os.makedirs(extract_path, exist_ok=True)
     os.makedirs("output", exist_ok=True)
     
-    # 1. Download & Extract
-    zip_p = "workspace/input.zip"
+    # 1. Download
+    archive_p = "workspace/input_file" # Extension unknown at this point
     print(f"Downloading: {URL}")
     headers = {'User-Agent': 'Mozilla/5.0'}
     with requests.get(URL, stream=True, headers=headers) as r:
         r.raise_for_status()
-        with open(zip_p, 'wb') as f: shutil.copyfileobj(r.raw, f)
-    with zipfile.ZipFile(zip_p, 'r') as z: z.extractall("workspace/extracted")
+        with open(archive_p, 'wb') as f: shutil.copyfileobj(r.raw, f)
 
-    # 2. Collect files
+    # 2. Universal Extraction using 7-Zip
+    print("Extracting with 7-Zip...")
+    try:
+        # 'x' = extract with full paths, '-o' = output directory, '-y' = assume yes to all
+        subprocess.run(['7z', 'x', archive_p, f'-o{extract_path}', '-y'], check=True)
+    except Exception as e:
+        print(f"Extraction failed: {e}")
+        return
+
+    # 3. Collect files
     valid = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.mov'}
-    all_files = sorted([os.path.join(r, f) for r, _, fs in os.walk("workspace/extracted") for f in fs if os.path.splitext(f)[1].lower() in valid], key=natural_sort_key)
+    all_files = sorted([os.path.join(r, f) for r, _, fs in os.walk(extract_path) for f in fs if os.path.splitext(f)[1].lower() in valid], key=natural_sort_key)
     
-    # 3. Process
+    # 4. Process
     clips = []
     print(f"Processing {len(all_files)} files...")
     for f in all_files:
@@ -110,12 +116,12 @@ def main():
             if clips and TRANSITION > 0: p = p.crossfadein(TRANSITION)
             clips.append(p)
 
-    # 4. Concatenate & Encode
+    # 5. Concatenate & Encode
     if clips:
         final = concatenate_videoclips(clips, method="compose", padding=-TRANSITION if TRANSITION > 0 else 0)
         out_path = f"output/{FILENAME}.mp4"
         
-        print("Rendering AV1...")
+        print(f"Rendering AV1 (CRF {CRF}, Preset {PRESET})...")
         final.write_videofile(
             out_path, 
             codec='libsvtav1', 
