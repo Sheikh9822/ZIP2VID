@@ -3,14 +3,16 @@ from PIL import Image, ImageFilter
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
-# --- CONFIG ---
+# --- RESTORED CONFIG ---
 URL = os.getenv('FILE_URL')
 MUSIC_URL = os.getenv('MUSIC_URL')
 DURATION = float(os.getenv('IMG_DURATION', '2.5'))
 FPS = 15 
 TARGET_BITRATE = "400k"
 AUDIO_BITRATE = "96k"
-PRESET = "12" 
+# Inputs from YML
+CRF = os.getenv('CRF', '32')
+PRESET = os.getenv('PRESET', '12')
 AR_TYPE = os.getenv('ASPECT_RATIO', 'Landscape (1920x1080)')
 FILENAME = os.getenv('FILENAME', 'av1_video')
 
@@ -20,17 +22,14 @@ RES_MAP = {
     'Square (1080x1080)': (1080, 1080)
 }
 W, H = RES_MAP.get(AR_TYPE, (1920, 1080))
-
-# 20 concurrent threads for maximum speed
 DOWNLOAD_THREADS = 20
 
 def fast_download(args):
     url, dest = args
     if os.path.exists(dest): return dest
     try:
-        # Mimic browser to avoid bot detection
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        with requests.get(url, headers=headers, stream=True, timeout=10) as r:
+        with requests.get(url, headers=headers, stream=True, timeout=15) as r:
             if r.status_code == 200:
                 with open(dest, 'wb') as f:
                     shutil.copyfileobj(r.raw, f)
@@ -42,11 +41,12 @@ def process_single_image(args):
     try:
         with Image.open(img_path) as img:
             img = img.convert('RGB')
-            # High speed blur: Resize down then up
+            # Fast Background Blur
             bg = img.resize((W, H), Image.Resampling.NEAREST)
             bg = bg.resize((100, int(100*(H/W))), Image.Resampling.NEAREST)
             bg = bg.filter(ImageFilter.GaussianBlur(5))
             bg = bg.resize((W, H), Image.Resampling.LANCZOS)
+            
             img.thumbnail((W, H), Image.Resampling.LANCZOS)
             offset = ((W - img.width) // 2, (H - img.height) // 2)
             bg.paste(img, offset)
@@ -66,15 +66,12 @@ def main():
         subprocess.run(['7z', 'x', 'workspace/input', '-oworkspace/extracted', '-y'])
     else:
         print("Scraping image URLs...")
-        # Get only the URLs from gallery-dl (very fast)
         result = subprocess.run(f'gallery-dl -g "{URL}"', shell=True, capture_output=True, text=True)
         urls = [u.strip() for u in result.stdout.split('\n') if u.strip().startswith('http')]
         
-        if not urls:
-            print("No URLs found with gallery-dl. Attempting direct fallback...")
-            return
+        if not urls: return
 
-        print(f"Downloading {len(urls)} images using {DOWNLOAD_THREADS} threads...")
+        print(f"Downloading {len(urls)} images...")
         download_tasks = [(u, os.path.join("workspace/extracted", f"raw_{i:04d}.jpg")) for i, u in enumerate(urls)]
         with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as executor:
             list(tqdm(executor.map(fast_download, download_tasks), total=len(download_tasks), desc="Downloading"))
@@ -88,8 +85,12 @@ def main():
         if os.path.exists("workspace/audio.mp3"): has_audio = True
 
     # 3. PARALLEL PROCESSING
-    files = sorted([os.path.join(dp, f) for dp, dn, fs in os.walk("workspace/extracted") for f in fs if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))],
-                    key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)])
+    files = []
+    for dp, dn, fs in os.walk("workspace/extracted"):
+        for f in fs:
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                files.append(os.path.join(dp, f))
+    files.sort(key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)])
     
     tasks = [(f, f"workspace/processed/img_{i:04d}.jpg") for i, f in enumerate(files)]
     with ThreadPoolExecutor() as executor:
@@ -98,12 +99,11 @@ def main():
     processed_files = [f for f in processed_files if f]
     if not processed_files: return
 
-    # 4. ENCODING
+    # 4. ENCODING (Restored Color/Bitrate/Metadata)
     out_video = f"output/{FILENAME}.mkv"
     audio_input = f'-i workspace/audio.mp3' if has_audio else ''
     audio_map = f'-map 0:v:0 -map 1:a:0 -shortest -c:a libopus -b:a {AUDIO_BITRATE}' if has_audio else '-c:a copy'
     
-    # Using spline scaling for better color accuracy + 10bit AV1
     cmd = (
         f'ffmpeg -y -framerate 1/{DURATION} -i workspace/processed/img_%04d.jpg {audio_input} '
         f'-vf "fps={FPS},scale={W}:{H}:flags=spline:out_color_matrix=bt709:out_range=pc,format=yuv420p10le" '
@@ -113,7 +113,6 @@ def main():
         f'{audio_map} "{out_video}"'
     )
 
-    print(f"Encoding AV1 (Target: {TARGET_BITRATE})...")
     subprocess.run(cmd, shell=True)
     subprocess.run(f'ffmpeg -y -i "{out_video}" -ss 00:00:01 -vframes 1 output/poster.jpg', shell=True)
 
