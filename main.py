@@ -6,10 +6,10 @@ import requests
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
 
-# --- FIX FOR PILLOW 10+ AND MOVIEPY 1.0.3 ---
+# --- PILLOW 10 + MOVIEPY 1.0.3 COMPATIBILITY ---
 if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.LANCZOS
-# --------------------------------------------
+# -----------------------------------------------
 
 from moviepy.editor import (
     VideoFileClip, ImageClip, CompositeVideoClip, 
@@ -18,34 +18,17 @@ from moviepy.editor import (
 
 # --- CONFIGURATION ---
 URL = os.getenv('FILE_URL')
-FILENAME = os.getenv('FILENAME', '').strip()
-if not FILENAME:
-    # Fallback: Extract name from URL parameter 'f' or path
-    try:
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(URL)
-        qs = parse_qs(parsed.query)
-        if 'f' in qs:
-            FILENAME = os.path.splitext(qs['f'][0])[0]
-        else:
-            FILENAME = os.path.basename(parsed.path).split(".")[0]
-    except:
-        FILENAME = "output"
+# Use ENV filename, if empty use a hard default to prevent crashes
+FILENAME = os.getenv('FILENAME', 'video_output').strip()
+if not FILENAME: FILENAME = "video_output"
 
-# Timing logic
-try:
-    raw_val = float(os.getenv('IMG_PER_SEC', '2.0'))
-    DURATION = raw_val if raw_val >= 0.1 else 2.0
-except:
-    DURATION = 2.0
-
+DURATION = float(os.getenv('IMG_DURATION', '0.33'))
 AR_TYPE = os.getenv('ASPECT_RATIO', 'Landscape (1920x1080)')
 CRF = os.getenv('CRF', '32')
 PRESET = os.getenv('PRESET', '10')
 
-# Standardize FPS and Transitions
 FPS = 30
-TRANSITION = min(0.4, DURATION * 0.3) if DURATION > 0.5 else 0
+TRANSITION = min(0.3, DURATION * 0.4) if DURATION > 0.4 else 0
 
 RES_MAP = {
     'Landscape (1920x1080)': (1920, 1080),
@@ -59,20 +42,16 @@ def natural_sort_key(s):
 
 def create_blurred_bg(pil_img):
     img = pil_img.convert('RGB')
-    img_w, img_h = img.size
-    img_aspect = img_w / img_h
+    img_aspect = img.width / img.height
     canvas_aspect = CANVAS_W / CANVAS_H
-
     if img_aspect > canvas_aspect:
         new_h = CANVAS_H
         new_w = int(CANVAS_H * img_aspect)
     else:
         new_w = CANVAS_W
         new_h = int(CANVAS_W / img_aspect)
-
     img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    left = (new_w - CANVAS_W) // 2
-    top = (new_h - CANVAS_H) // 2
+    left, top = (new_w - CANVAS_W) // 2, (new_h - CANVAS_H) // 2
     img = img.crop((left, top, left + CANVAS_W, top + CANVAS_H))
     img = img.filter(ImageFilter.GaussianBlur(radius=50))
     return np.array(ImageEnhance.Brightness(img).enhance(0.4))
@@ -81,7 +60,6 @@ def process_media(filepath):
     try:
         ext = os.path.splitext(filepath)[1].lower()
         is_video = ext in ['.mp4', '.mov', '.gif', '.webm']
-        
         if is_video:
             clip = VideoFileClip(filepath)
             if ext == '.gif': clip = clip.without_audio()
@@ -93,51 +71,41 @@ def process_media(filepath):
         else:
             with Image.open(filepath) as img: bg_arr = create_blurred_bg(img)
             clip = ImageClip(filepath).set_duration(DURATION)
-
         bg_clip = ImageClip(bg_arr).set_duration(clip.duration)
         scale = min(CANVAS_W / clip.w, CANVAS_H / clip.h)
         fg_clip = clip.resize(scale).set_position("center")
-        
         if not is_video and DURATION > 1.0:
-            fg_clip = fg_clip.resize(lambda t: 1 + 0.04 * (t / DURATION))
-
+            fg_clip = fg_clip.resize(lambda t: 1 + 0.03 * (t / DURATION))
         return CompositeVideoClip([bg_clip, fg_clip], size=(CANVAS_W, CANVAS_H)).set_fps(FPS)
     except Exception as e:
-        print(f"Error processing {filepath}: {e}")
+        print(f"Skipping {filepath}: {e}")
         return None
 
 def main():
-    extract_path = "workspace/extracted"
+    workspace = "workspace"
+    extract_path = os.path.join(workspace, "extracted")
     os.makedirs(extract_path, exist_ok=True)
     os.makedirs("output", exist_ok=True)
     
+    zip_p = os.path.join(workspace, "input.zip")
     print(f"Downloading: {URL}")
-    zip_p = "workspace/input.zip"
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        with requests.get(URL, stream=True, timeout=60, headers=headers) as r:
-            r.raise_for_status()
-            with open(zip_p, 'wb') as f: shutil.copyfileobj(r.raw, f)
-    except Exception as e:
-        print(f"Download failed: {e}")
-        return
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    with requests.get(URL, stream=True, headers=headers) as r:
+        r.raise_for_status()
+        with open(zip_p, 'wb') as f: shutil.copyfileobj(r.raw, f)
 
-    print("Extracting files...")
-    try:
-        with zipfile.ZipFile(zip_p, 'r') as z: z.extractall(extract_path)
-    except Exception as e:
-        print(f"Extraction failed: {e}")
-        return
+    print("Extracting...")
+    with zipfile.ZipFile(zip_p, 'r') as z: z.extractall(extract_path)
 
-    valid_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4'}
-    all_files = sorted([os.path.join(r, f) for r, _, fs in os.walk(extract_path) for f in fs if os.path.splitext(f)[1].lower() in valid_exts], key=natural_sort_key)
+    valid = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.mov'}
+    all_files = sorted([os.path.join(r, f) for r, _, fs in os.walk(extract_path) for f in fs if os.path.splitext(f)[1].lower() in valid], key=natural_sort_key)
     
     if not all_files:
-        print("No valid media files found.")
+        print("No media found.")
         return
 
-    print(f"Processing {len(all_files)} files...")
     clips = []
+    print(f"Processing {len(all_files)} files...")
     for f in all_files:
         processed = process_media(f)
         if processed:
@@ -145,39 +113,18 @@ def main():
             clips.append(processed)
 
     if clips:
-        print("Merging clips...")
         final = concatenate_videoclips(clips, method="compose", padding=-TRANSITION if TRANSITION > 0 else 0)
         out_path = f"output/{FILENAME}.mp4"
         
-        # Optimized FFmpeg parameters for SVT-AV1
-        # Removed '-svtav1-params' to fix "Unrecognized option" error
-        ffmpeg_params = [
-            '-crf', str(CRF),
-            '-preset', str(PRESET),
-            '-pix_fmt', 'yuv420p10le'
-        ]
-        
-        print(f"Rendering Video: {out_path}")
         try:
-            final.write_videofile(
-                out_path, 
-                codec='libsvtav1', 
-                audio_codec='aac',
-                threads=os.cpu_count(),
-                ffmpeg_params=ffmpeg_params
-            )
-        except Exception as e:
-            print(f"AV1 Encoding failed: {e}")
-            print("FALLING BACK TO H.264 (Standard MP4)...")
-            final.write_videofile(
-                out_path, 
-                codec='libx264', 
-                audio_codec='aac',
-                threads=os.cpu_count(),
-                preset='medium',
-                bitrate='5000k'
-            )
-        print(f"Done! Saved to {out_path}")
+            print("Attempting libsvtav1...")
+            final.write_videofile(out_path, codec='libsvtav1', audio_codec='aac', threads=os.cpu_count(),
+                                 ffmpeg_params=['-crf', str(CRF), '-preset', str(PRESET), '-pix_fmt', 'yuv420p10le'])
+        except:
+            print("Falling back to H.264...")
+            final.write_videofile(out_path, codec='libx264', audio_codec='aac', preset='medium')
+        
+    print(f"Finished: {out_path}")
 
 if __name__ == "__main__":
     main()
