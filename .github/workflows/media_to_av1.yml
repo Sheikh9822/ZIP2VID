@@ -38,7 +38,7 @@ jobs:
           cache: 'pip'
 
       - name: Install Python Libs
-        run: pip install pillow requests numpy imageio imageio-ffmpeg
+        run: pip install pillow requests numpy imageio imageio-ffmpeg tqdm
 
       - name: Generate AV1 MKV
         id: process
