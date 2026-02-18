@@ -50,36 +50,25 @@ jobs:
         run: |
           URL="${{ inputs.file_url }}"
           CUSTOM="${{ inputs.filename }}"
-          
           if [[ -n "$CUSTOM" ]]; then
             NAME="$CUSTOM"
           elif [[ "$URL" == *"f="* ]]; then
-            # Extract from Kemono style links: ?f=Name.zip
             NAME=$(echo "$URL" | grep -oP 'f=\K[^&]+')
-            NAME="${NAME%.*}" # Remove extension
+            NAME="${NAME%.*}"
           else
-            # Standard URL path extraction
             CLEAN_URL="${URL%%?*}"
             NAME=$(basename "$CLEAN_URL")
             NAME="${NAME%.*}"
           fi
-          
-          # URL Decode (replaces %20 and + with spaces)
           NAME=$(echo "$NAME" | sed 's/+/ /g;s/%\([0-9A-F][0-9A-F]\)/\\x\1/g' | xargs -0 printf "%b")
-          
-          # Sanitize: Remove characters not allowed in filenames
           NAME=$(echo "$NAME" | sed 's/[^a-zA-Z0-9._ -]/_/g')
-          
           if [[ -z "$NAME" ]]; then NAME="video_output"; fi
-          
           echo "artifact_name=$NAME" >> $GITHUB_OUTPUT
-          echo "Final Filename: $NAME"
 
-      - name: Setup FFmpeg
-        uses: federicocarboni/setup-ffmpeg@v3
+      - name: Setup FFmpeg (AV1 Feature-Complete)
+        uses: yt-dlp/FFmpeg-Builds@main
         with:
-          # This version is stable and includes libsvtav1
-          token: ${{ secrets.GITHUB_TOKEN }}
+          version: 'latest'
 
       - name: Setup Python
         uses: actions/setup-python@v5
