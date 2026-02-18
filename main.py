@@ -1,4 +1,4 @@
-import os, re, shutil, subprocess, requests
+import os, re, shutil, subprocess, requests, time
 from PIL import Image, ImageFilter
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
@@ -10,7 +10,7 @@ DURATION = float(os.getenv('IMG_DURATION', '2.5'))
 FPS = 15 
 TARGET_BITRATE = "400k"
 AUDIO_BITRATE = "96k"
-PRESET = os.getenv('PRESET', '12') 
+PRESET = "12" 
 AR_TYPE = os.getenv('ASPECT_RATIO', 'Landscape (1920x1080)')
 FILENAME = os.getenv('FILENAME', 'av1_video')
 
@@ -26,43 +26,42 @@ def process_single_image(args):
     try:
         with Image.open(img_path) as img:
             img = img.convert('RGB')
-            # High speed blur
             bg = img.resize((W, H), Image.Resampling.NEAREST)
             bg = bg.resize((100, int(100*(H/W))), Image.Resampling.NEAREST)
             bg = bg.filter(ImageFilter.GaussianBlur(5))
             bg = bg.resize((W, H), Image.Resampling.LANCZOS)
-            
             img.thumbnail((W, H), Image.Resampling.LANCZOS)
             offset = ((W - img.width) // 2, (H - img.height) // 2)
             bg.paste(img, offset)
             bg.save(out_path, "JPEG", quality=95, subsampling=0)
             return out_path
-    except:
-        return None
+    except: return None
 
 def main():
     os.makedirs("workspace/extracted", exist_ok=True)
     os.makedirs("workspace/processed", exist_ok=True)
     os.makedirs("output", exist_ok=True)
 
-    # 1. Scrape
+    # 1. Scrape with Retry Logic
     if any(URL.lower().split('?')[0].endswith(e) for e in ('.zip', '.rar', '.7z')):
         with requests.get(URL, stream=True) as r:
             with open("workspace/input", 'wb') as f: shutil.copyfileobj(r.raw, f)
         subprocess.run(['7z', 'x', 'workspace/input', '-oworkspace/extracted', '-y'])
     else:
-        subprocess.run(f'gallery-dl --dest workspace/extracted "{URL}"', shell=True)
+        print("Scraping gallery...")
+        for _ in range(3): # Retry 3 times
+            res = subprocess.run(f'gallery-dl --dest workspace/extracted "{URL}"', shell=True)
+            if res.returncode == 0: break
+            time.sleep(5)
 
-    # 2. Audio (Improved Resilience)
+    # 2. Audio with Resilience
     has_audio = False
     if MUSIC_URL:
-        # Added --no-check-certificate and user-agent to help bypass bot detection
+        print("Downloading audio...")
+        # Added no-check-certificate and user-agent to bypass bot detection
         audio_cmd = f'yt-dlp --no-check-certificate --user-agent "Mozilla/5.0" -x --audio-format mp3 -o "workspace/audio.mp3" "{MUSIC_URL}"'
         subprocess.run(audio_cmd, shell=True)
-        if os.path.exists("workspace/audio.mp3"): 
-            has_audio = True
-        else:
-            print("Audio download failed (Bot Blocked). Proceeding without audio.")
+        if os.path.exists("workspace/audio.mp3"): has_audio = True
 
     # 3. Parallel Image Processing
     files = []
@@ -79,14 +78,11 @@ def main():
     processed_files = [f for f in processed_files if f]
     if not processed_files: return
 
-    # 4. Encoding Fixes
+    # 4. Encoding with Fixed Color IDs and Bitrate
     out_video = f"output/{FILENAME}.mkv"
     audio_input = f'-i workspace/audio.mp3' if has_audio else ''
     audio_map = f'-map 0:v:0 -map 1:a:0 -shortest -c:a libopus -b:a {AUDIO_BITRATE}' if has_audio else '-c:a copy'
     
-    # 1. Use numeric IDs for color (1 = BT.709, 1 = PC/Full Range)
-    # 2. Remove -maxrate to satisfy SVT-AV1 target bitrate mode
-    # 3. Explicitly set color space flags for the MKV container
     cmd = (
         f'ffmpeg -y -framerate 1/{DURATION} -i workspace/processed/img_%04d.jpg {audio_input} '
         f'-vf "fps={FPS},scale={W}:{H}:out_color_matrix=bt709:out_range=pc,format=yuv420p10le" '
@@ -96,7 +92,6 @@ def main():
         f'{audio_map} "{out_video}"'
     )
 
-    print(f"Encoding Video (Target: {TARGET_BITRATE} Video + {AUDIO_BITRATE} Audio)...")
     subprocess.run(cmd, shell=True)
     subprocess.run(f'ffmpeg -y -i "{out_video}" -ss 00:00:01 -vframes 1 output/poster.jpg', shell=True)
 
