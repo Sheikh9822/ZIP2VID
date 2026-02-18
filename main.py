@@ -1,157 +1,75 @@
-import os
-import re
-import shutil
-import subprocess
-import requests
+import os, re, shutil, subprocess, requests, zipfile
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
+from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip, concatenate_videoclips
 
-# --- MONKEYPATCH PILLOW 10 FOR MOVIEPY ---
-if not hasattr(Image, 'ANTIALIAS'):
-    Image.ANTIALIAS = Image.LANCZOS
-# -----------------------------------------
+# Monkeypatch for Pillow 10
+if not hasattr(Image, 'ANTIALIAS'): Image.ANTIALIAS = Image.LANCZOS
 
-from moviepy.editor import (
-    VideoFileClip, ImageClip, CompositeVideoClip, 
-    concatenate_videoclips
-)
-
-# --- LOAD CONFIG FROM GITHUB ENVIRONMENT ---
+# Configuration
 URL = os.getenv('FILE_URL')
-FILENAME = os.getenv('FILENAME', 'output').strip()
 DURATION = float(os.getenv('IMG_DURATION', '0.33'))
 AR_TYPE = os.getenv('ASPECT_RATIO', 'Landscape (1920x1080)')
-CRF = os.getenv('CRF', '32')
-PRESET = os.getenv('PRESET', '10')
+RES_MAP = {'Landscape (1920x1080)': (1920, 1080), 'Portrait (1080x1920)': (1080, 1920), 'Square (1080x1080)': (1080, 1080)}
+W, H = RES_MAP.get(AR_TYPE, (1920, 1080))
 
-FPS = 30
-# If duration is 0.33s (3 img/sec), disable transitions to avoid blur
-TRANSITION = min(0.3, DURATION * 0.4) if DURATION > 0.5 else 0
-
-# Resolution Mapping
-RES_MAP = {
-    'Landscape (1920x1080)': (1920, 1080),
-    'Portrait (1080x1920)': (1080, 1920),
-    'Square (1080x1080)': (1080, 1080)
-}
-CANVAS_W, CANVAS_H = RES_MAP.get(AR_TYPE, (1920, 1080))
-
-def natural_sort_key(s):
-    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
-
-def create_blurred_bg(pil_img):
-    """Universal Strategy: Fit media inside, fill empty areas with blurred background."""
+def create_bg(pil_img):
     img = pil_img.convert('RGB')
-    scale = max(CANVAS_W / img.width, CANVAS_H / img.height)
-    new_w, new_h = int(img.width * scale), int(img.height * scale)
-    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    
-    # Center Crop
-    left = (new_w - CANVAS_W) // 2
-    top = (new_h - CANVAS_H) // 2
-    img = img.crop((left, top, left + CANVAS_W, top + CANVAS_H))
-    
-    # Blur and Darken
-    img = img.filter(ImageFilter.GaussianBlur(radius=50))
+    scale = max(W / img.width, H / img.height)
+    img = img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS)
+    img = img.crop(((img.width-W)//2, (img.height-H)//2, (img.width+W)//2, (img.height+H)//2))
+    img = img.filter(ImageFilter.GaussianBlur(radius=40))
     return np.array(ImageEnhance.Brightness(img).enhance(0.4))
 
-def process_media(filepath):
+def process_media(path):
     try:
-        ext = os.path.splitext(filepath)[1].lower()
-        is_video = ext in ['.mp4', '.mov', '.gif', '.webm', '.webp']
+        ext = os.path.splitext(path)[1].lower()
+        is_vid = ext in ['.mp4', '.mov', '.gif', '.webp']
+        clip = VideoFileClip(path) if is_vid else ImageClip(path).set_duration(DURATION)
+        if ext in ['.gif', '.webp']: clip = clip.without_audio()
+        if is_vid and clip.duration < DURATION: clip = clip.loop(duration=DURATION)
         
-        if is_video:
-            clip = VideoFileClip(filepath)
-            if ext in ['.gif', '.webp']: clip = clip.without_audio()
-            # Loop short animations to match requested duration
-            if clip.duration < DURATION:
-                clip = clip.loop(duration=DURATION)
-            
-            # Extract first frame for background
-            temp_f = f"{filepath}_t.jpg"
-            clip.save_frame(temp_f, t=0)
-            with Image.open(temp_f) as thumb: bg_arr = create_blurred_bg(thumb)
-            os.remove(temp_f)
+        # BG Logic
+        if is_vid:
+            clip.save_frame("t.jpg", t=0)
+            bg_arr = create_bg(Image.open("t.jpg"))
+            os.remove("t.jpg")
         else:
-            with Image.open(filepath) as img: bg_arr = create_blurred_bg(img)
-            clip = ImageClip(filepath).set_duration(DURATION)
-
-        bg_clip = ImageClip(bg_arr).set_duration(clip.duration)
+            bg_arr = create_bg(Image.open(path))
         
-        # FOREGROUND FIT (No Cropping)
-        scale = min(CANVAS_W / clip.w, CANVAS_H / clip.h)
-        fg_clip = clip.resize(scale).set_position("center")
-        
-        # Subtle Zoom for static images (only if slow duration)
-        if not is_video and DURATION > 1.0:
-            fg_clip = fg_clip.resize(lambda t: 1 + 0.03 * (t / DURATION))
-
-        return CompositeVideoClip([bg_clip, fg_clip], size=(CANVAS_W, CANVAS_H)).set_fps(FPS)
-    except Exception as e:
-        print(f"Skipping {filepath}: {e}")
-        return None
+        # FG Logic (FIT - NO CROP)
+        scale = min(W / clip.w, H / clip.h)
+        fg = clip.resize(scale).set_position("center")
+        return CompositeVideoClip([ImageClip(bg_arr).set_duration(clip.duration), fg], size=(W, H)).set_fps(30)
+    except: return None
 
 def main():
-    extract_path = "workspace/extracted"
-    os.makedirs(extract_path, exist_ok=True)
+    os.makedirs("workspace/extracted", exist_ok=True)
     os.makedirs("output", exist_ok=True)
     
-    # 1. Download
-    archive_p = "workspace/input_archive"
-    print(f"Downloading: {URL}")
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    with requests.get(URL, stream=True, headers=headers) as r:
-        r.raise_for_status()
-        with open(archive_p, 'wb') as f: shutil.copyfileobj(r.raw, f)
-
-    # 2. Universal Extract using 7-Zip (Handles RAR, ZIP, CBZ)
-    print("Extracting with 7-Zip...")
-    try:
-        subprocess.run(['7z', 'x', archive_p, f'-o{extract_path}', '-y'], check=True)
-    except Exception as e:
-        print(f"Extraction Error: {e}")
-        return
-
-    # 3. Collect files
-    valid = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.mov'}
-    all_files = []
-    for r, d, fs in os.walk(extract_path):
-        for f in fs:
-            if os.path.splitext(f)[1].lower() in valid:
-                all_files.append(os.path.join(r, f))
-    all_files.sort(key=natural_sort_key)
+    # Name Logic
+    user_fname = os.getenv('FILENAME', '').strip()
+    if user_fname: fname = user_fname
+    else: fname = re.search(r'f=([^&]+)', URL).group(1).rsplit('.', 1)[0] if 'f=' in URL else "slideshow"
+    fname = re.sub(r'[^a-zA-Z0-9_-]', '_', fname)
     
-    if not all_files:
-        print("No valid media files found.")
-        return
-
-    # 4. Process into Clips
-    clips = []
-    print(f"Processing {len(all_files)} files...")
-    for f in all_files:
-        p = process_media(f)
-        if p:
-            if clips and TRANSITION > 0: p = p.crossfadein(TRANSITION)
-            clips.append(p)
-
-    # 5. Concatenate & Render to AV1
+    # Download & Extract
+    r = requests.get(URL, headers={'User-Agent': 'Mozilla/5.0'})
+    with open("workspace/input", 'wb') as f: f.write(r.content)
+    subprocess.run(['7z', 'x', 'workspace/input', '-oworkspace/extracted', '-y'])
+    
+    # Process
+    files = sorted([os.path.join(dp, f) for dp, dn, filenames in os.walk("workspace/extracted") for f in filenames if os.path.splitext(f)[1].lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4']], key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)])
+    clips = [process_media(f) for f in files]
+    clips = [c for c in clips if c is not None]
+    
     if clips:
-        final = concatenate_videoclips(clips, method="compose", padding=-TRANSITION if TRANSITION > 0 else 0)
-        out_path = f"output/{FILENAME}.mp4"
+        # Write high-quality H264 master
+        final = concatenate_videoclips(clips, method="compose")
+        final.write_videofile("workspace/master.mp4", codec="libx264", bitrate="20000k", fps=30)
         
-        print(f"Encoding AV1 (CRF: {CRF}, Preset: {PRESET})...")
-        final.write_videofile(
-            out_path, 
-            codec='libsvtav1', 
-            audio_codec='aac',
-            threads=os.cpu_count(),
-            ffmpeg_params=[
-                '-crf', str(CRF), 
-                '-preset', str(PRESET), 
-                '-pix_fmt', 'yuv420p10le'
-            ]
-        )
-        print(f"Success! Saved: {out_path}")
+        # Pass filename to GitHub Actions
+        with open(os.getenv('GITHUB_OUTPUT'), 'a') as go:
+            go.write(f"final_name={fname}\n")
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
