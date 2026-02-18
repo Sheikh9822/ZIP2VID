@@ -1,4 +1,4 @@
-name: Direct AV1 Slideshow (No MoviePy)
+name: Direct AV1 MKV Slideshow
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt update
-          sudo apt install -y ffmpeg p7zip-full wget
+          sudo apt install -y ffmpeg p7zip-full wget mediainfo
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -40,7 +40,7 @@ jobs:
       - name: Install Python Libs
         run: pip install pillow requests numpy imageio imageio-ffmpeg
 
-      - name: Generate AV1 Video
+      - name: Generate AV1 MKV
         id: process
         env:
           FILE_URL: ${{ inputs.file_url }}
@@ -54,4 +54,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.process.outputs.final_name }}
-          path: output/*.mp4
+          path: output/*.mkv
