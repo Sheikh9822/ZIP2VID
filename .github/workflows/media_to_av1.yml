@@ -1,77 +1,110 @@
-name: Media to AV1 Video
+name: ZIP to AV1 Video Generator
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Direct URL to ZIP/CBZ'
+        description: 'Direct URL to ZIP/CBZ file'
         required: true
+        type: string
       filename:
-        description: 'Output name (empty = auto-detect)'
+        description: 'Output Filename (Leave empty for auto-detect)'
         required: false
+        type: string
+        default: ''
       aspect_ratio:
-        description: 'Video Format'
+        description: 'Video Orientation'
+        required: true
         type: choice
-        options: ['Landscape (1920x1080)', 'Portrait (1080x1920)', 'Square (1080x1080)']
+        options: 
+          - 'Landscape (1920x1080)'
+          - 'Portrait (1080x1920)'
+          - 'Square (1080x1080)'
         default: 'Landscape (1920x1080)'
-      img_per_sec:
-        description: 'Image Duration (seconds per image)'
-        default: '2.0'
+      img_duration:
+        description: 'Seconds per Image (0.33 = 3 img/sec)'
+        required: true
+        default: '0.33'
+        type: string
       crf:
-        description: 'Quality (Higher = lower quality, 30-35 recommended)'
+        description: 'AV1 Quality (30-35 is standard)'
+        required: true
         default: '32'
+        type: string
       preset:
-        description: 'SVT-AV1 Preset (Faster 12 - Slower 8)'
+        description: 'SVT-AV1 Preset (8-12)'
+        required: true
         default: '10'
+        type: string
 
 jobs:
-  build:
+  generate-video:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Calculate Name
         id: meta
         shell: bash
         run: |
-          if [[ -n "${{ inputs.filename }}" ]]; then
-            NAME="${{ inputs.filename }}"
+          URL="${{ inputs.file_url }}"
+          CUSTOM="${{ inputs.filename }}"
+          
+          if [[ -n "$CUSTOM" ]]; then
+            NAME="$CUSTOM"
+          elif [[ "$URL" == *"f="* ]]; then
+            # Extract from ?f= parameter (used by Kemono/etc)
+            NAME=$(echo "$URL" | sed -n 's/.*f=\([^&]*\).*/\1/p')
+            NAME="${NAME%.*}" # Remove .zip/.cbz
           else
-            # Extract filename from URL and remove extension
-            URL_PATH="${{ inputs.file_url }}"
-            NAME=$(basename "${URL_PATH%%?*}")
+            # Standard URL path extraction
+            CLEAN_URL="${URL%%?*}"
+            NAME=$(basename "$CLEAN_URL")
             NAME="${NAME%.*}"
           fi
-          # Sanitize filename (remove special characters)
-          NAME=$(echo "$NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
-          echo "final_name=$NAME" >> $GITHUB_OUTPUT
+          
+          # URL Decode (replaces %20 with spaces, etc)
+          NAME=$(printf '%b' "${NAME//%/\\x}")
+          
+          # Sanitize: Remove characters not allowed in filenames
+          NAME=$(echo "$NAME" | sed 's/[^a-zA-Z0-9._ -]/_/g')
+          
+          # Absolute Fallback if still empty
+          if [[ -z "$NAME" ]]; then NAME="video_output"; fi
+          
+          echo "artifact_name=$NAME" >> $GITHUB_OUTPUT
+          echo "Using Filename: $NAME"
 
-      - name: FFmpeg Setup
-        uses: federicocarboni/setup-ffmpeg@v3
+      - name: Setup FFmpeg (AV1 Enabled)
+        uses: shaka-project/setup-ffmpeg@v2
+        with:
+          version: '6.0'
 
-      - name: Python Setup
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
       - name: Install Dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install moviepy==1.0.3 pillow requests numpy decorator==4.4.2 imageio-ffmpeg tqdm
 
-      - name: Run Processing
+      - name: Process Video
         env:
           FILE_URL: ${{ inputs.file_url }}
-          FILENAME: ${{ steps.meta.outputs.final_name }}
+          FILENAME: ${{ steps.meta.outputs.artifact_name }}
           ASPECT_RATIO: ${{ inputs.aspect_ratio }}
-          IMG_PER_SEC: ${{ inputs.img_per_sec }}
+          IMG_DURATION: ${{ inputs.img_duration }}
           CRF: ${{ inputs.crf }}
           PRESET: ${{ inputs.preset }}
         run: python main.py
 
-      - name: Upload Artifact
+      - name: Upload Video
+        # Use the ID 'meta' output
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.meta.outputs.final_name }}
+          name: ${{ steps.meta.outputs.artifact_name }}
           path: output/*.mp4
           retention-days: 7
