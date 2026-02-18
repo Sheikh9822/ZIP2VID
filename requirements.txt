@@ -1,0 +1,7 @@
+moviepy==1.0.3
+pillow
+requests
+numpy
+decorator==4.4.2
+imageio-ffmpeg
+tqdm
