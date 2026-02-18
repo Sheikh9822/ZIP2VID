@@ -1,10 +1,10 @@
-name: Direct AV1 MKV Slideshow
+name: Universal Media to AV1 MKV
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Direct URL to ZIP/RAR/CBZ'
+        description: 'Direct Link (ZIP/RAR) OR Webpage URL'
         required: true
       filename:
         description: 'Output Name'
@@ -38,9 +38,9 @@ jobs:
           cache: 'pip'
 
       - name: Install Python Libs
-        run: pip install pillow requests numpy imageio imageio-ffmpeg tqdm
+        run: pip install pillow requests numpy imageio imageio-ffmpeg tqdm beautifulsoup4 lxml
 
-      - name: Generate AV1 MKV
+      - name: Scrape and Generate AV1
         id: process
         env:
           FILE_URL: ${{ inputs.file_url }}
