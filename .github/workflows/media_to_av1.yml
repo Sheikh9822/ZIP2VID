@@ -7,7 +7,7 @@ on:
         description: 'Direct URL to ZIP/RAR/CBZ'
         required: true
       filename:
-        description: 'Output Name (Empty = Auto)'
+        description: 'Output Name'
         required: false
       aspect_ratio:
         description: 'Orientation'
@@ -18,11 +18,11 @@ on:
         description: 'Seconds per image (0.33 = 3 images/sec)'
         default: '0.33'
       crf:
-        description: 'AV1 CRF (32-40)'
-        default: '32'
+        description: 'AV1 CRF (31-45)'
+        default: '35'
       preset:
-        description: 'SVT-AV1 Preset (8-12)'
-        default: '10'
+        description: 'SVT-AV1 Preset (4-10)'
+        default: '6'
 
 jobs:
   build:
@@ -31,33 +31,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Calculate Dynamic Name
-        id: meta
-        shell: bash
+      - name: Install System Dependencies
         run: |
-          URL="${{ inputs.file_url }}"
-          if [[ -n "${{ inputs.filename }}" ]]; then
-            NAME="${{ inputs.filename }}"
-          elif [[ "$URL" == *"f="* ]]; then
-            # Handles Kemono links specifically
-            NAME=$(echo "$URL" | grep -oP 'f=\K[^&]+' | sed 's/\.[^.]*$//')
-          else
-            NAME=$(basename "${URL%%?*}" | sed 's/\.[^.]*$//')
-          fi
-          # Sanitize
-          NAME=$(printf '%b' "${NAME//%/\\x}" | sed 's/[^a-zA-Z0-9._ -]/_/g')
-          [ -z "$NAME" ] && NAME="slideshow_output"
-          echo "final_name=$NAME" >> $GITHUB_OUTPUT
-
-      - name: Install System Dependencies (7-Zip & FFmpeg)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y p7zip-full
-          # Downloading BtbN build - extremely reliable for AV1
-          wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
-          tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz
-          sudo mv ffmpeg-master-latest-linux64-gpl/bin/* /usr/local/bin/
-          ffmpeg -version
+          sudo apt update
+          sudo apt install -y ffmpeg p7zip-full wget mediainfo
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -65,21 +42,32 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Python Dependencies
-        run: pip install moviepy==1.0.3 pillow requests numpy decorator==4.4.2 imageio-ffmpeg tqdm
+      - name: Install Python Libs
+        run: pip install moviepy==1.0.3 pillow requests numpy decorator==4.4.2
 
-      - name: Generate Video
+      - name: Step 1 - Generate High-Quality Master (Python)
+        id: meta
         env:
           FILE_URL: ${{ inputs.file_url }}
-          FILENAME: ${{ steps.meta.outputs.final_name }}
+          FILENAME: ${{ inputs.filename }}
           ASPECT_RATIO: ${{ inputs.aspect_ratio }}
           IMG_DURATION: ${{ inputs.img_duration }}
-          CRF: ${{ inputs.crf }}
-          PRESET: ${{ inputs.preset }}
         run: python main.py
 
-      - name: Upload Artifact
+      - name: Step 2 - Encode to AV1 (System FFmpeg)
+        run: |
+          # Use the exact logic from your working workflow
+          ffmpeg -i workspace/master.mp4 \
+            -c:v libsvtav1 \
+            -preset ${{ inputs.preset }} \
+            -crf ${{ inputs.crf }} \
+            -svtav1-params "tune=0:aq-mode=2:enable-overlays=1:scd=1:lookahead=60:tile-columns=2:tile-rows=1" \
+            -c:a libopus -b:a 96k \
+            -pix_fmt yuv420p10le \
+            "output/${{ steps.meta.outputs.final_name }}.mp4"
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.final_name }}
-          path: output/*.mp4
+          path: output/*.mkv
