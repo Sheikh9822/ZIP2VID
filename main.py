@@ -5,7 +5,6 @@ from tqdm import tqdm
 from playwright.async_api import async_playwright
 from urllib.parse import urljoin, urlparse
 
-# Monkeypatch for Pillow 10
 if not hasattr(Image, 'ANTIALIAS'): Image.ANTIALIAS = Image.LANCZOS
 
 # --- CONFIG ---
@@ -13,7 +12,7 @@ URL = os.getenv('FILE_URL')
 DURATION = float(os.getenv('IMG_DURATION', '0.33'))
 FPS = 30
 CRF = os.getenv('CRF', '32')
-PRESET = os.getenv('PRESET', '8')
+PRESET = os.getenv('PRESET', '12')
 AR_TYPE = os.getenv('ASPECT_RATIO', 'Landscape (1920x1080)')
 FILENAME = os.getenv('FILENAME', 'av1_slideshow')
 
@@ -25,13 +24,10 @@ RES_MAP = {
 W, H = RES_MAP.get(AR_TYPE, (1920, 1080))
 
 async def scrape_media(target_url, folder):
-    print(f"Scraping Webpage: {target_url}")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         await page.goto(target_url, wait_until="networkidle")
-        
-        # Scrape Kemono specific patterns
         urls = await page.evaluate("""() => {
             const list = [];
             document.querySelectorAll('a.image-link').forEach(a => list.push(a.href));
@@ -40,10 +36,8 @@ async def scrape_media(target_url, folder):
             return list.filter(u => u);
         }""")
         await browser.close()
-        
         urls = list(dict.fromkeys(urls))
-        print(f"Found {len(urls)} items. Downloading...")
-        for i, u in enumerate(tqdm(urls)):
+        for i, u in enumerate(urls):
             try:
                 full_u = urljoin(target_url, u)
                 ext = os.path.splitext(urlparse(full_u).path)[1] or ".jpg"
@@ -53,22 +47,27 @@ async def scrape_media(target_url, folder):
                             shutil.copyfileobj(r.raw, f)
             except: pass
 
-def get_processed_frame(pil_img, zoom=1.0):
+def prepare_background(pil_img):
+    """Generates the blurred background ONCE per item."""
     bg = pil_img.convert('RGB')
     s = max(W/bg.width, H/bg.height)
     bg = bg.resize((int(bg.width*s), int(bg.height*s)), Image.Resampling.LANCZOS)
     bg = bg.crop(((bg.width-W)//2, (bg.height-H)//2, (bg.width+W)//2, (bg.height+H)//2))
-    # Optimized blur
-    small = bg.resize((160, 90), Image.Resampling.NEAREST)
-    blurred = small.filter(ImageFilter.GaussianBlur(radius=2))
+    # Super fast blur
+    small = bg.resize((80, 45), Image.Resampling.NEAREST)
+    blurred = small.filter(ImageFilter.GaussianBlur(radius=1))
     bg = blurred.resize((W, H), Image.Resampling.LANCZOS)
-    bg = ImageEnhance.Brightness(bg).enhance(0.4)
-    # Fit FG
+    return ImageEnhance.Brightness(bg).enhance(0.4)
+
+def composite_frame(bg_cached, pil_img, zoom=1.0):
+    """Pastes resized foreground onto pre-blurred background."""
+    canvas = bg_cached.copy()
     fg = pil_img.convert('RGB')
     fs = min(W/fg.width, H/fg.height)
+    # Resize FG
     fg = fg.resize((int(fg.width*fs*zoom), int(fg.height*fs*zoom)), Image.Resampling.LANCZOS)
-    bg.paste(fg, ((W-fg.width)//2, (H-fg.height)//2))
-    return bg
+    canvas.paste(fg, ((W-fg.width)//2, (H-fg.height)//2))
+    return canvas
 
 async def main():
     os.makedirs("workspace/extracted", exist_ok=True)
@@ -88,11 +87,12 @@ async def main():
     if not files: return
     out_path = f"output/{FILENAME}.mkv"
 
+    # FFmpeg Pipe
     cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{W}x{H}', 
         '-pix_fmt', 'rgb24', '-r', str(FPS), '-i', '-', 
         '-c:v', 'libsvtav1', '-crf', CRF, '-preset', PRESET,
-        '-svtav1-params', 'tune=0:enable-overlays=1',
+        '-svtav1-params', 'tune=0:enable-overlays=1:tile-columns=1',
         '-pix_fmt', 'yuv420p10le', '-c:a', 'libopus', '-b:a', '128k', out_path
     ]
     process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -102,17 +102,32 @@ async def main():
             if f.lower().endswith(('.mp4', '.gif', '.webp')):
                 reader = imageio.get_reader(f)
                 limit = int(DURATION * FPS) if not f.lower().endswith('.mp4') else 9999
+                
+                # For video/gif, we still need to process BG per frame to be safe, 
+                # but we'll only do it if it's the first frame to save time.
+                bg_cached = None
+                
                 for i, frame in enumerate(reader):
-                    process.stdin.write(get_processed_frame(Image.fromarray(frame)).tobytes())
+                    pil_frame = Image.fromarray(frame)
+                    if bg_cached is None: bg_cached = prepare_background(pil_frame)
+                    
+                    final_frame = composite_frame(bg_cached, pil_frame)
+                    process.stdin.write(final_frame.tobytes())
                     if i >= limit: break
                 reader.close()
             else:
+                # STATIC IMAGE - OPTIMIZED
                 with Image.open(f) as img:
-                    frames = int(DURATION * FPS)
-                    for i in range(frames):
-                        z = 1.0 + (0.02 * (i/frames))
-                        process.stdin.write(get_processed_frame(img, zoom=z).tobytes())
-        except: pass
+                    bg_cached = prepare_background(img)
+                    num_frames = int(DURATION * FPS)
+                    
+                    for i in range(num_frames):
+                        # Only apply zoom if duration is significant
+                        z = 1.0 + (0.02 * (i/num_frames)) if DURATION > 0.5 else 1.0
+                        final_frame = composite_frame(bg_cached, img, zoom=z)
+                        process.stdin.write(final_frame.tobytes())
+        except Exception as e:
+            print(f"Error processing {f}: {e}")
 
     process.stdin.close()
     process.wait()
