@@ -1,10 +1,10 @@
-name: ZIP to AV1 Slideshow
+name: ZIP/RAR to AV1 Slideshow
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Direct URL to ZIP/CBZ'
+        description: 'Direct URL to ZIP/RAR/CBZ'
         required: true
       filename:
         description: 'Output Name (Empty = Auto)'
@@ -43,17 +43,17 @@ jobs:
           else
             NAME=$(basename "${URL%%?*}" | sed 's/\.[^.]*$//')
           fi
-          # Decode URL characters and sanitize
           NAME=$(printf '%b' "${NAME//%/\\x}" | sed 's/[^a-zA-Z0-9._ -]/_/g')
           [ -z "$NAME" ] && NAME="slideshow_av1"
           echo "final_name=$NAME" >> $GITHUB_OUTPUT
 
-      - name: Install AV1-Enabled FFmpeg (BtbN)
+      - name: Install System Dependencies (7-Zip & FFmpeg)
         run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
           wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz
           sudo mv ffmpeg-master-latest-linux64-gpl/bin/* /usr/local/bin/
-          ffmpeg -version | grep svtav1
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -61,7 +61,7 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Dependencies
+      - name: Install Python Dependencies
         run: pip install moviepy==1.0.3 pillow requests numpy decorator==4.4.2 imageio-ffmpeg tqdm
 
       - name: Generate Video
