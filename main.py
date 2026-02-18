@@ -48,23 +48,19 @@ async def scrape_media(target_url, folder):
             except: pass
 
 def prepare_background(pil_img):
-    """Generates the blurred background ONCE per item."""
     bg = pil_img.convert('RGB')
     s = max(W/bg.width, H/bg.height)
     bg = bg.resize((int(bg.width*s), int(bg.height*s)), Image.Resampling.LANCZOS)
     bg = bg.crop(((bg.width-W)//2, (bg.height-H)//2, (bg.width+W)//2, (bg.height+H)//2))
-    # Super fast blur
     small = bg.resize((80, 45), Image.Resampling.NEAREST)
     blurred = small.filter(ImageFilter.GaussianBlur(radius=1))
     bg = blurred.resize((W, H), Image.Resampling.LANCZOS)
     return ImageEnhance.Brightness(bg).enhance(0.4)
 
 def composite_frame(bg_cached, pil_img, zoom=1.0):
-    """Pastes resized foreground onto pre-blurred background."""
     canvas = bg_cached.copy()
     fg = pil_img.convert('RGB')
     fs = min(W/fg.width, H/fg.height)
-    # Resize FG
     fg = fg.resize((int(fg.width*fs*zoom), int(fg.height*fs*zoom)), Image.Resampling.LANCZOS)
     canvas.paste(fg, ((W-fg.width)//2, (H-fg.height)//2))
     return canvas
@@ -87,14 +83,23 @@ async def main():
     if not files: return
     out_path = f"output/{FILENAME}.mkv"
 
-    # FFmpeg Pipe
+    # --- UPDATED FFMPEG PIPE FOR COLOR ACCURACY ---
     cmd = [
-        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{W}x{H}', 
-        '-pix_fmt', 'rgb24', '-r', str(FPS), '-i', '-', 
-        '-c:v', 'libsvtav1', '-crf', CRF, '-preset', PRESET,
-        '-svtav1-params', 'tune=0:enable-overlays=1:tile-columns=1',
-        '-pix_fmt', 'yuv420p10le', '-c:a', 'libopus', '-b:a', '128k', out_path
+        'ffmpeg', '-y',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo', 
+        '-s', f'{W}x{H}', '-pix_fmt', 'rgb24', '-r', str(FPS), 
+        '-i', '-', 
+        # Explicitly convert RGB to YUV using BT.709 Matrix (HD Standard)
+        '-vf', 'scale=out_color_matrix=bt709:out_range=pc,format=yuv420p10le',
+        '-c:v', 'libsvtav1', 
+        '-crf', CRF, 
+        '-preset', PRESET,
+        # Signal BT.709 metadata to the player
+        '-svtav1-params', 'tune=0:enable-overlays=1:tile-columns=1:color-primaries=1:transfer-characteristics=1:matrix-coefficients=1:color-range=1',
+        '-c:a', 'libopus', '-b:a', '128k', 
+        out_path
     ]
+    
     process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     for f in tqdm(files, desc="Encoding"):
@@ -102,32 +107,24 @@ async def main():
             if f.lower().endswith(('.mp4', '.gif', '.webp')):
                 reader = imageio.get_reader(f)
                 limit = int(DURATION * FPS) if not f.lower().endswith('.mp4') else 9999
-                
-                # For video/gif, we still need to process BG per frame to be safe, 
-                # but we'll only do it if it's the first frame to save time.
                 bg_cached = None
-                
                 for i, frame in enumerate(reader):
                     pil_frame = Image.fromarray(frame)
                     if bg_cached is None: bg_cached = prepare_background(pil_frame)
-                    
                     final_frame = composite_frame(bg_cached, pil_frame)
                     process.stdin.write(final_frame.tobytes())
                     if i >= limit: break
                 reader.close()
             else:
-                # STATIC IMAGE - OPTIMIZED
                 with Image.open(f) as img:
                     bg_cached = prepare_background(img)
                     num_frames = int(DURATION * FPS)
-                    
                     for i in range(num_frames):
-                        # Only apply zoom if duration is significant
                         z = 1.0 + (0.02 * (i/num_frames)) if DURATION > 0.5 else 1.0
                         final_frame = composite_frame(bg_cached, img, zoom=z)
                         process.stdin.write(final_frame.tobytes())
         except Exception as e:
-            print(f"Error processing {f}: {e}")
+            pass
 
     process.stdin.close()
     process.wait()
