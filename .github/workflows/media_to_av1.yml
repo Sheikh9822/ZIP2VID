@@ -1,4 +1,4 @@
-name: ZIP/RAR to AV1 Slideshow
+name: Direct AV1 Slideshow (No MoviePy)
 
 on:
   workflow_dispatch:
@@ -9,20 +9,15 @@ on:
       filename:
         description: 'Output Name'
         required: false
-      aspect_ratio:
-        description: 'Orientation'
-        type: choice
-        options: ['Landscape (1920x1080)', 'Portrait (1080x1920)', 'Square (1080x1080)']
-        default: 'Landscape (1920x1080)'
       img_duration:
-        description: 'Seconds per image (0.33 = 3 images/sec)'
+        description: 'Seconds per image (0.33 = 3 img/sec)'
         default: '0.33'
       crf:
-        description: 'AV1 CRF (31-45)'
-        default: '35'
+        description: 'AV1 CRF (30-40)'
+        default: '32'
       preset:
-        description: 'SVT-AV1 Preset (4-10)'
-        default: '6'
+        description: 'SVT-AV1 Preset (6-10)'
+        default: '8'
 
 jobs:
   build:
@@ -34,7 +29,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt update
-          sudo apt install -y ffmpeg p7zip-full wget mediainfo
+          sudo apt install -y ffmpeg p7zip-full wget
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -43,31 +38,20 @@ jobs:
           cache: 'pip'
 
       - name: Install Python Libs
-        run: pip install moviepy==1.0.3 pillow requests numpy decorator==4.4.2
+        run: pip install pillow requests numpy imageio imageio-ffmpeg
 
-      - name: Step 1 - Generate High-Quality Master (Python)
-        id: meta
+      - name: Generate AV1 Video
+        id: process
         env:
           FILE_URL: ${{ inputs.file_url }}
           FILENAME: ${{ inputs.filename }}
-          ASPECT_RATIO: ${{ inputs.aspect_ratio }}
           IMG_DURATION: ${{ inputs.img_duration }}
+          CRF: ${{ inputs.crf }}
+          PRESET: ${{ inputs.preset }}
         run: python main.py
-
-      - name: Step 2 - Encode to AV1 (System FFmpeg)
-        run: |
-          # Use the exact logic from your working workflow
-          ffmpeg -i workspace/master.mp4 \
-            -c:v libsvtav1 \
-            -preset ${{ inputs.preset }} \
-            -crf ${{ inputs.crf }} \
-            -svtav1-params "tune=0:aq-mode=2:enable-overlays=1:scd=1:lookahead=60:tile-columns=2:tile-rows=1" \
-            -c:a libopus -b:a 96k \
-            -pix_fmt yuv420p10le \
-            "output/${{ steps.meta.outputs.final_name }}.mp4"
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.meta.outputs.final_name }}
-          path: output/*.mkv
+          name: ${{ steps.process.outputs.final_name }}
+          path: output/*.mp4
