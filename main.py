@@ -1,75 +1,108 @@
-import os, re, shutil, subprocess, requests, zipfile
+import os, re, shutil, subprocess, requests, imageio
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
-from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip, concatenate_videoclips
-
-# Monkeypatch for Pillow 10
-if not hasattr(Image, 'ANTIALIAS'): Image.ANTIALIAS = Image.LANCZOS
 
 # Configuration
 URL = os.getenv('FILE_URL')
 DURATION = float(os.getenv('IMG_DURATION', '0.33'))
-AR_TYPE = os.getenv('ASPECT_RATIO', 'Landscape (1920x1080)')
-RES_MAP = {'Landscape (1920x1080)': (1920, 1080), 'Portrait (1080x1920)': (1080, 1920), 'Square (1080x1080)': (1080, 1080)}
-W, H = RES_MAP.get(AR_TYPE, (1920, 1080))
+W, H = 1920, 1080
+FPS = 30
+CRF = os.getenv('CRF', '32')
+PRESET = os.getenv('PRESET', '8')
 
-def create_bg(pil_img):
-    img = pil_img.convert('RGB')
-    scale = max(W / img.width, H / img.height)
-    img = img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS)
-    img = img.crop(((img.width-W)//2, (img.height-H)//2, (img.width+W)//2, (img.height+H)//2))
-    img = img.filter(ImageFilter.GaussianBlur(radius=40))
-    return np.array(ImageEnhance.Brightness(img).enhance(0.4))
+def get_processed_frame(pil_img):
+    """Universal Strategy: Blurred BG (Fill) + Original (Fit)"""
+    # 1. Create Blurred BG (Fast method)
+    bg = pil_img.convert('RGB')
+    small = bg.resize((160, 90), Image.Resampling.NEAREST)
+    blurred = small.filter(ImageFilter.GaussianBlur(radius=2))
+    bg = blurred.resize((W, H), Image.Resampling.LANCZOS)
+    bg = ImageEnhance.Brightness(bg).enhance(0.4)
 
-def process_media(path):
-    try:
-        ext = os.path.splitext(path)[1].lower()
-        is_vid = ext in ['.mp4', '.mov', '.gif', '.webp']
-        clip = VideoFileClip(path) if is_vid else ImageClip(path).set_duration(DURATION)
-        if ext in ['.gif', '.webp']: clip = clip.without_audio()
-        if is_vid and clip.duration < DURATION: clip = clip.loop(duration=DURATION)
-        
-        # BG Logic
-        if is_vid:
-            clip.save_frame("t.jpg", t=0)
-            bg_arr = create_bg(Image.open("t.jpg"))
-            os.remove("t.jpg")
-        else:
-            bg_arr = create_bg(Image.open(path))
-        
-        # FG Logic (FIT - NO CROP)
-        scale = min(W / clip.w, H / clip.h)
-        fg = clip.resize(scale).set_position("center")
-        return CompositeVideoClip([ImageClip(bg_arr).set_duration(clip.duration), fg], size=(W, H)).set_fps(30)
-    except: return None
+    # 2. Create Foreground (Fit - No Crop)
+    fg = pil_img.convert('RGB')
+    fg.thumbnail((W, H), Image.Resampling.LANCZOS)
+    
+    # 3. Composite
+    bg.paste(fg, ((W - fg.width) // 2, (H - fg.height) // 2))
+    return bg
 
 def main():
     os.makedirs("workspace/extracted", exist_ok=True)
     os.makedirs("output", exist_ok=True)
     
-    # Name Logic
-    user_fname = os.getenv('FILENAME', '').strip()
-    if user_fname: fname = user_fname
-    else: fname = re.search(r'f=([^&]+)', URL).group(1).rsplit('.', 1)[0] if 'f=' in URL else "slideshow"
+    # Filename Setup
+    match = re.search(r'f=([^&]+)', URL)
+    fname = os.getenv('FILENAME', '').strip() or (match.group(1).rsplit('.', 1)[0] if match else "output")
     fname = re.sub(r'[^a-zA-Z0-9_-]', '_', fname)
-    
-    # Download & Extract
-    r = requests.get(URL, headers={'User-Agent': 'Mozilla/5.0'})
-    with open("workspace/input", 'wb') as f: f.write(r.content)
-    subprocess.run(['7z', 'x', 'workspace/input', '-oworkspace/extracted', '-y'])
-    
-    # Process
-    files = sorted([os.path.join(dp, f) for dp, dn, filenames in os.walk("workspace/extracted") for f in filenames if os.path.splitext(f)[1].lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4']], key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)])
-    clips = [process_media(f) for f in files]
-    clips = [c for c in clips if c is not None]
-    
-    if clips:
-        # Write high-quality H264 master
-        final = concatenate_videoclips(clips, method="compose")
-        final.write_videofile("workspace/master.mp4", codec="libx264", bitrate="20000k", fps=30)
-        
-        # Pass filename to GitHub Actions
-        with open(os.getenv('GITHUB_OUTPUT'), 'a') as go:
-            go.write(f"final_name={fname}\n")
+    out_path = f"output/{fname}.mp4"
 
-if __name__ == "__main__": main()
+    # Download & Extract
+    print("Downloading and Extracting...")
+    r = requests.get(URL, headers={'User-Agent': 'Mozilla/5.0'}, stream=True)
+    with open("workspace/input", 'wb') as f: shutil.copyfileobj(r.raw, f)
+    subprocess.run(['7z', 'x', 'workspace/input', '-oworkspace/extracted', '-y'], check=True)
+
+    # Collect Files
+    valid_exts = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4')
+    files = []
+    for dp, dn, filenames in os.walk("workspace/extracted"):
+        for f in filenames:
+            if f.lower().endswith(valid_exts):
+                files.append(os.path.join(dp, f))
+    files.sort(key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', s)])
+
+    # Setup FFmpeg Pipe for Direct AV1 Encoding
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{W}x{H}', '-pix_fmt', 'rgb24', '-r', str(FPS),
+        '-i', '-', # Input from pipe
+        '-c:v', 'libsvtav1',
+        '-crf', CRF,
+        '-preset', PRESET,
+        '-svtav1-params', 'tune=0:enable-overlays=1',
+        '-pix_fmt', 'yuv420p10le',
+        '-c:a', 'libopus', # Placeholder for audio if needed
+        out_path
+    ]
+    
+    process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    print(f"Starting Direct AV1 Encoding: {len(files)} items...")
+    
+    for i, f in enumerate(files):
+        print(f"[{i+1}/{len(files)}] {os.path.basename(f)}")
+        ext = f.lower()
+        
+        if ext.endswith(('.mp4', '.gif', '.webp')):
+            # Handle Video/Animated
+            reader = imageio.get_reader(f)
+            fps_in = reader.get_meta_data().get('fps', FPS)
+            n_frames = int(max(DURATION * FPS, 1)) if ext.endswith(('.gif', '.webp')) else None
+            
+            count = 0
+            for frame in reader:
+                pil_frame = Image.fromarray(frame)
+                processed = get_processed_frame(pil_frame)
+                process.stdin.write(processed.tobytes())
+                count += 1
+                if n_frames and count >= n_frames: break
+            reader.close()
+        else:
+            # Handle Static Images
+            with Image.open(f) as img:
+                processed = get_processed_frame(img)
+                frame_bytes = processed.tobytes()
+                # Repeat frame to match duration
+                for _ in range(int(DURATION * FPS)):
+                    process.stdin.write(frame_bytes)
+
+    process.stdin.close()
+    process.wait()
+
+    with open(os.getenv('GITHUB_OUTPUT'), 'a') as go:
+        go.write(f"final_name={fname}\n")
+
+if __name__ == "__main__":
+    main()
