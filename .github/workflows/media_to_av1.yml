@@ -1,4 +1,4 @@
-name: Universal Media to AV1 MKV
+name: Universal AV1 Video Generator
 
 on:
   workflow_dispatch:
@@ -9,6 +9,11 @@ on:
       filename:
         description: 'Output Name'
         required: false
+      aspect_ratio:
+        description: 'Orientation'
+        type: choice
+        options: ['Landscape (1920x1080)', 'Portrait (1080x1920)', 'Square (1080x1080)']
+        default: 'Landscape (1920x1080)'
       img_duration:
         description: 'Seconds per image (0.33 = 3 img/sec)'
         default: '0.33'
@@ -29,7 +34,13 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt update
-          sudo apt install -y ffmpeg p7zip-full wget mediainfo
+          sudo apt install -y ffmpeg p7zip-full wget xz-utils
+
+      - name: Setup FFmpeg (BtbN Build)
+        run: |
+          wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz
+          sudo mv ffmpeg-master-latest-linux64-gpl/bin/* /usr/local/bin/
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,13 +49,15 @@ jobs:
           cache: 'pip'
 
       - name: Install Python Libs
-        run: pip install pillow requests numpy imageio imageio-ffmpeg tqdm beautifulsoup4 lxml
+        run: |
+          pip install pillow requests numpy imageio imageio-ffmpeg tqdm playwright playwright-stealth
+          playwright install chromium --with-deps
 
-      - name: Scrape and Generate AV1
-        id: process
+      - name: Generate Video
         env:
           FILE_URL: ${{ inputs.file_url }}
           FILENAME: ${{ inputs.filename }}
+          ASPECT_RATIO: ${{ inputs.aspect_ratio }}
           IMG_DURATION: ${{ inputs.img_duration }}
           CRF: ${{ inputs.crf }}
           PRESET: ${{ inputs.preset }}
