@@ -5,6 +5,13 @@ import zipfile
 import requests
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
+
+# --- FIX FOR PILLOW 10+ AND MOVIEPY 1.0.3 ---
+# This must happen BEFORE moviepy imports
+if not hasattr(Image, 'ANTIALIAS'):
+    Image.ANTIALIAS = Image.LANCZOS
+# --------------------------------------------
+
 from moviepy.editor import (
     VideoFileClip, ImageClip, CompositeVideoClip, 
     concatenate_videoclips
@@ -12,10 +19,25 @@ from moviepy.editor import (
 
 # --- CONFIGURATION ---
 URL = os.getenv('FILE_URL')
-FILENAME = os.getenv('FILENAME', 'output')
-# Interpret IMG_PER_SEC as "seconds per image" if it's high, 
-# or use the math from the original script
-DURATION = float(os.getenv('IMG_PER_SEC', '2.0'))
+# Use ENV filename, if empty try to guess from URL
+FILENAME = os.getenv('FILENAME', '').strip()
+if not FILENAME:
+    # Fallback if the GitHub Action meta step failed to pass a name
+    FILENAME = os.path.basename(URL.split("?")[0]).split(".")[0] or "output"
+
+# Timing: Use the value from ENV. Logs show ".5" which means 1 image every 2 seconds.
+try:
+    # If the user provides 0.5, we treat it as seconds per image. 
+    # If they provide 3, we treat it as 3 images per second.
+    raw_val = float(os.getenv('IMG_PER_SEC', '2.0'))
+    if raw_val >= 1.0:
+        DURATION = raw_val
+    else:
+        # If value is less than 1 (like .5), assume they mean 1/val (e.g. 1/0.5 = 2 seconds)
+        DURATION = 1.0 / raw_val
+except:
+    DURATION = 2.0
+
 AR_TYPE = os.getenv('ASPECT_RATIO', 'Landscape (1920x1080)')
 CRF = os.getenv('CRF', '32')
 PRESET = os.getenv('PRESET', '10')
@@ -35,19 +57,20 @@ def natural_sort_key(s):
 def create_blurred_bg(pil_img):
     """Creates a darkened, blurred background that fills the canvas."""
     img = pil_img.convert('RGB')
+    img_w, img_h = img.size
+    
     # Aspect Fill logic
-    img_aspect = img.width / img.height
+    img_aspect = img_w / img_h
     canvas_aspect = CANVAS_W / CANVAS_H
 
     if img_aspect > canvas_aspect:
-        # Image is wider than canvas
         new_h = CANVAS_H
         new_w = int(CANVAS_H * img_aspect)
     else:
-        # Image is taller than canvas
         new_w = CANVAS_W
         new_h = int(CANVAS_W / img_aspect)
 
+    # Use Resampling.LANCZOS for Pillow 10 compatibility
     img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
     
     # Center Crop
@@ -85,8 +108,9 @@ def process_media(filepath):
 
         bg_clip = ImageClip(bg_arr).set_duration(clip.duration)
 
-        # Foreground "Fit" logic
+        # Foreground "Fit" logic (Universal Strategy)
         scale = min(CANVAS_W / clip.w, CANVAS_H / clip.h)
+        # Using MoviePy's resize which we fixed with the monkeypatch above
         fg_clip = clip.resize(scale).set_position("center")
         
         # Ken Burns effect for static images
@@ -106,7 +130,9 @@ def main():
     print(f"Downloading: {URL}")
     zip_p = "workspace/input.zip"
     try:
-        with requests.get(URL, stream=True, timeout=60) as r:
+        # Set a user-agent to avoid being blocked by some servers (like Kemono)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        with requests.get(URL, stream=True, timeout=60, headers=headers) as r:
             r.raise_for_status()
             with open(zip_p, 'wb') as f:
                 shutil.copyfileobj(r.raw, f)
@@ -115,10 +141,14 @@ def main():
         return
 
     print("Extracting files...")
-    with zipfile.ZipFile(zip_p, 'r') as z:
-        z.extractall(extract_path)
+    try:
+        with zipfile.ZipFile(zip_p, 'r') as z:
+            z.extractall(extract_path)
+    except Exception as e:
+        print(f"Extraction failed (might not be a valid ZIP): {e}")
+        return
 
-    valid_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.cbz'}
+    valid_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4'}
     all_files = []
     for root, _, fs in os.walk(extract_path):
         for f in fs:
@@ -145,11 +175,10 @@ def main():
         final = concatenate_videoclips(clips, method="compose", padding=-TRANSITION if TRANSITION > 0 else 0)
         out_path = f"output/{FILENAME}.mp4"
         
-        # svt-av1 parameters for high efficiency
         ffmpeg_params = [
             '-crf', str(CRF),
             '-preset', str(PRESET),
-            '-pix_fmt', 'yuv420p10le', # 10-bit for better AV1 compression
+            '-pix_fmt', 'yuv420p10le',
             '-svtav1-params', 'tune=0:enable-overlays=1'
         ]
         
