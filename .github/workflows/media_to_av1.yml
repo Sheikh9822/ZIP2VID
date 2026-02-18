@@ -39,21 +39,25 @@ jobs:
           if [[ -n "${{ inputs.filename }}" ]]; then
             NAME="${{ inputs.filename }}"
           elif [[ "$URL" == *"f="* ]]; then
+            # Handles Kemono links specifically
             NAME=$(echo "$URL" | grep -oP 'f=\K[^&]+' | sed 's/\.[^.]*$//')
           else
             NAME=$(basename "${URL%%?*}" | sed 's/\.[^.]*$//')
           fi
+          # Sanitize
           NAME=$(printf '%b' "${NAME//%/\\x}" | sed 's/[^a-zA-Z0-9._ -]/_/g')
-          [ -z "$NAME" ] && NAME="slideshow_av1"
+          [ -z "$NAME" ] && NAME="slideshow_output"
           echo "final_name=$NAME" >> $GITHUB_OUTPUT
 
       - name: Install System Dependencies (7-Zip & FFmpeg)
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full
+          # Downloading BtbN build - extremely reliable for AV1
           wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz
           sudo mv ffmpeg-master-latest-linux64-gpl/bin/* /usr/local/bin/
+          ffmpeg -version
 
       - name: Setup Python
         uses: actions/setup-python@v5
