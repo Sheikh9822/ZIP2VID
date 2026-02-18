@@ -7,7 +7,7 @@ on:
         description: 'Direct Link (ZIP/RAR) OR Webpage URL'
         required: true
       filename:
-        description: 'Output Name'
+        description: 'Output Name (Optional)'
         required: false
       aspect_ratio:
         description: 'Orientation'
@@ -18,10 +18,10 @@ on:
         description: 'Seconds per image (0.33 = 3 img/sec)'
         default: '0.33'
       crf:
-        description: 'AV1 CRF (30-40)'
+        description: 'AV1 CRF (32-40)'
         default: '32'
       preset:
-        description: 'SVT-AV1 Preset (6-10)'
+        description: 'SVT-AV1 Preset (8-12)'
         default: '8'
 
 jobs:
@@ -31,12 +31,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Calculate Name
+        id: meta
+        shell: bash
+        run: |
+          URL="${{ inputs.file_url }}"
+          if [[ -n "${{ inputs.filename }}" ]]; then
+            NAME="${{ inputs.filename }}"
+          elif [[ "$URL" == *"f="* ]]; then
+            NAME=$(echo "$URL" | grep -oP 'f=\K[^&]+' | sed 's/\.[^.]*$//')
+          else
+            NAME=$(basename "${URL%%?*}" | sed 's/\.[^.]*$//')
+          fi
+          # Decode and Sanitize
+          NAME=$(printf '%b' "${NAME//%/\\x}" 2>/dev/null | sed 's/[^a-zA-Z0-9._ -]/_/g' || echo "av1_slideshow")
+          if [ -z "$NAME" ]; then NAME="av1_slideshow"; fi
+          echo "final_name=$NAME" >> $GITHUB_OUTPUT
+          echo "Calculated Name: $NAME"
+
       - name: Install System Dependencies
         run: |
           sudo apt update
           sudo apt install -y ffmpeg p7zip-full wget xz-utils
 
-      - name: Setup FFmpeg (BtbN Build)
+      - name: Install FFmpeg (BtbN Build)
         run: |
           wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz
@@ -54,9 +72,10 @@ jobs:
           playwright install chromium --with-deps
 
       - name: Generate Video
+        id: process
         env:
           FILE_URL: ${{ inputs.file_url }}
-          FILENAME: ${{ inputs.filename }}
+          FILENAME: ${{ steps.meta.outputs.final_name }}
           ASPECT_RATIO: ${{ inputs.aspect_ratio }}
           IMG_DURATION: ${{ inputs.img_duration }}
           CRF: ${{ inputs.crf }}
@@ -66,5 +85,6 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.process.outputs.final_name }}
+          # Using the name calculated at the start
+          name: ${{ steps.meta.outputs.final_name }}
           path: output/*.mkv
