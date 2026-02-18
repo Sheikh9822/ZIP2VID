@@ -4,14 +4,28 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'URL'
+        description: 'Image Source (Gallery or ZIP)'
         required: true
       music_url:
-        description: 'Audio URL'
+        description: 'Audio Source (YouTube/Direct)'
         required: false
+      filename:
+        description: 'Output Filename'
+        default: 'av1_video'
+      aspect_ratio:
+        description: 'Orientation'
+        type: choice
+        options: ['Landscape (1920x1080)', 'Portrait (1080x1920)', 'Square (1080x1080)']
+        default: 'Landscape (1920x1080)'
       img_duration:
-        description: 'Duration'
+        description: 'Seconds per image'
         default: '2.5'
+      crf:
+        description: 'AV1 CRF (Only used if Bitrate is removed)'
+        default: '32'
+      preset:
+        description: 'SVT-AV1 Preset (10-13)'
+        default: '12'
 
 jobs:
   build:
@@ -25,7 +39,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ffmpeg-bin
-          key: ${{ runner.os }}-ffmpeg-v2
+          key: ${{ runner.os }}-ffmpeg-v3
 
       - name: Install FFmpeg
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
@@ -34,7 +48,7 @@ jobs:
           wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz --strip-components=2 -C ffmpeg-bin
           
-      - name: Setup Environment
+      - name: Setup System
         run: |
           echo "${{ github.workspace }}/ffmpeg-bin" >> $GITHUB_PATH
           sudo apt-get update && sudo apt-get install -y p7zip-full
@@ -45,20 +59,22 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Dependencies
-        run: |
-          # Use a single pip command to speed up resolution
-          pip install pillow requests tqdm gallery-dl yt-dlp
+      - name: Install Tools
+        run: pip install pillow requests tqdm gallery-dl yt-dlp
 
       - name: Generate Video
         env:
           FILE_URL: ${{ inputs.file_url }}
           MUSIC_URL: ${{ inputs.music_url }}
+          FILENAME: ${{ inputs.filename }}
+          ASPECT_RATIO: ${{ inputs.aspect_ratio }}
           IMG_DURATION: ${{ inputs.img_duration }}
+          CRF: ${{ inputs.crf }}
+          PRESET: ${{ inputs.preset }}
         run: python main.py
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: av1_result
+          name: ${{ inputs.filename }}
           path: output/
