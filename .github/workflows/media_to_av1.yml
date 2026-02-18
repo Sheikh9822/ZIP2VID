@@ -1,74 +1,59 @@
-name: ZIP to AV1 Video Generator
+name: ZIP to AV1 Slideshow
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Direct URL to ZIP/CBZ file'
+        description: 'Direct URL to ZIP/CBZ'
         required: true
-        type: string
       filename:
-        description: 'Output Filename (Leave empty for auto-detect)'
+        description: 'Output Name (Empty = Auto)'
         required: false
-        type: string
-        default: ''
       aspect_ratio:
-        description: 'Video Orientation'
-        required: true
+        description: 'Orientation'
         type: choice
-        options: 
-          - 'Landscape (1920x1080)'
-          - 'Portrait (1080x1920)'
-          - 'Square (1080x1080)'
+        options: ['Landscape (1920x1080)', 'Portrait (1080x1920)', 'Square (1080x1080)']
         default: 'Landscape (1920x1080)'
       img_duration:
-        description: 'Seconds per Image (0.33 = 3 img/sec)'
-        required: true
+        description: 'Seconds per image (0.33 = 3 images/sec)'
         default: '0.33'
-        type: string
       crf:
-        description: 'AV1 Quality (30-35 is standard)'
-        required: true
+        description: 'AV1 CRF (32-40)'
         default: '32'
-        type: string
       preset:
         description: 'SVT-AV1 Preset (8-12)'
-        required: true
         default: '10'
-        type: string
 
 jobs:
-  generate-video:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Calculate Name
+      - name: Calculate Dynamic Name
         id: meta
         shell: bash
         run: |
           URL="${{ inputs.file_url }}"
-          CUSTOM="${{ inputs.filename }}"
-          if [[ -n "$CUSTOM" ]]; then
-            NAME="$CUSTOM"
+          if [[ -n "${{ inputs.filename }}" ]]; then
+            NAME="${{ inputs.filename }}"
           elif [[ "$URL" == *"f="* ]]; then
-            NAME=$(echo "$URL" | grep -oP 'f=\K[^&]+')
-            NAME="${NAME%.*}"
+            NAME=$(echo "$URL" | grep -oP 'f=\K[^&]+' | sed 's/\.[^.]*$//')
           else
-            CLEAN_URL="${URL%%?*}"
-            NAME=$(basename "$CLEAN_URL")
-            NAME="${NAME%.*}"
+            NAME=$(basename "${URL%%?*}" | sed 's/\.[^.]*$//')
           fi
-          NAME=$(echo "$NAME" | sed 's/+/ /g;s/%\([0-9A-F][0-9A-F]\)/\\x\1/g' | xargs -0 printf "%b")
-          NAME=$(echo "$NAME" | sed 's/[^a-zA-Z0-9._ -]/_/g')
-          if [[ -z "$NAME" ]]; then NAME="video_output"; fi
-          echo "artifact_name=$NAME" >> $GITHUB_OUTPUT
+          # Decode URL characters and sanitize
+          NAME=$(printf '%b' "${NAME//%/\\x}" | sed 's/[^a-zA-Z0-9._ -]/_/g')
+          [ -z "$NAME" ] && NAME="slideshow_av1"
+          echo "final_name=$NAME" >> $GITHUB_OUTPUT
 
-      - name: Setup FFmpeg (AV1 Feature-Complete)
-        uses: yt-dlp/FFmpeg-Builds@main
-        with:
-          version: 'latest'
+      - name: Install AV1-Enabled FFmpeg (BtbN)
+        run: |
+          wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz
+          sudo mv ffmpeg-master-latest-linux64-gpl/bin/* /usr/local/bin/
+          ffmpeg -version | grep svtav1
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -77,22 +62,20 @@ jobs:
           cache: 'pip'
 
       - name: Install Dependencies
-        run: |
-          pip install moviepy==1.0.3 pillow requests numpy decorator==4.4.2 imageio-ffmpeg tqdm
+        run: pip install moviepy==1.0.3 pillow requests numpy decorator==4.4.2 imageio-ffmpeg tqdm
 
-      - name: Process Video
+      - name: Generate Video
         env:
           FILE_URL: ${{ inputs.file_url }}
-          FILENAME: ${{ steps.meta.outputs.artifact_name }}
+          FILENAME: ${{ steps.meta.outputs.final_name }}
           ASPECT_RATIO: ${{ inputs.aspect_ratio }}
           IMG_DURATION: ${{ inputs.img_duration }}
           CRF: ${{ inputs.crf }}
           PRESET: ${{ inputs.preset }}
         run: python main.py
 
-      - name: Upload Video
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.meta.outputs.artifact_name }}
+          name: ${{ steps.meta.outputs.final_name }}
           path: output/*.mp4
-          retention-days: 7
