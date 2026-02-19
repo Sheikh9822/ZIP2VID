@@ -11,18 +11,12 @@ on:
         required: false
       filename:
         description: 'Output Filename'
-        default: 'av1_video'
+        default: 'av1_montage'
       aspect_ratio:
         description: 'Orientation'
         type: choice
         options: ['Landscape (1920x1080)', 'Portrait (1080x1920)', 'Square (1080x1080)']
         default: 'Landscape (1920x1080)'
-      img_duration:
-        description: 'Seconds per image'
-        default: '2.5'
-      crf:
-        description: 'AV1 CRF (Only used if Bitrate is removed)'
-        default: '32'
       preset:
         description: 'SVT-AV1 Preset (10-13)'
         default: '12'
@@ -68,8 +62,6 @@ jobs:
           MUSIC_URL: ${{ inputs.music_url }}
           FILENAME: ${{ inputs.filename }}
           ASPECT_RATIO: ${{ inputs.aspect_ratio }}
-          IMG_DURATION: ${{ inputs.img_duration }}
-          CRF: ${{ inputs.crf }}
           PRESET: ${{ inputs.preset }}
         run: python main.py
 
