@@ -1,8 +1,12 @@
+import asyncio
 import os, re, shutil, subprocess, sys, time, logging
 import requests
+import aiohttp
 from PIL import Image, ImageFilter
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+from urllib.parse import urlparse, parse_qs, unquote
+from ehapi import EHentaiScraper
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -56,42 +60,126 @@ HEADERS = {
         'AppleWebKit/537.36 (KHTML, like Gecko) '
         'Chrome/122.0.0.0 Safari/537.36'
     ),
-    'Referer': 'https://kemono.cr/'  # Fix: hotlink protection bypass
+    'Referer': 'https://kemono.cr/'
 }
 
 ARCHIVE_EXTS = ('.zip', '.rar', '.7z')
+
+
+# ---------------------------------------------------------------------------
+# URL CLASSIFICATION
+# ---------------------------------------------------------------------------
 
 def url_looks_like_archive(url: str) -> bool:
     """
     Detect archives even when the real filename is in the ?f= query param.
     e.g. https://n1.kemono.cr/data/.../foo.bin?f=asuka+tanaka.zip
     """
-    from urllib.parse import urlparse, parse_qs, unquote
     parsed = urlparse(url)
-    # Check path first
     if any(parsed.path.lower().endswith(e) for e in ARCHIVE_EXTS):
         return True
-    # Check ?f= param (kemono CDN pattern)
     f_param = parse_qs(parsed.query).get('f', [''])[0]
     if f_param and any(unquote(f_param).lower().endswith(e) for e in ARCHIVE_EXTS):
         return True
     return False
 
+def url_is_ehentai(url: str) -> bool:
+    """Detect e-hentai gallery URLs."""
+    parsed = urlparse(url)
+    return parsed.netloc in ('e-hentai.org', 'www.e-hentai.org') and parsed.path.startswith('/g/')
+
+def extract_ehentai_gallery_id(url: str) -> str:
+    """Extract gallery_id/token from URL like https://e-hentai.org/g/3469255/5aca9cae10/"""
+    match = re.search(r'/g/(\d+)/([a-f0-9]+)', url)
+    if not match:
+        log.error(f"Could not parse e-hentai gallery ID from URL: {url}")
+        sys.exit(1)
+    return f"{match.group(1)}/{match.group(2)}"
+
 
 # ---------------------------------------------------------------------------
-# DOWNLOAD
+# E-HENTAI DOWNLOAD  (uses ehapi.py scraper directly, no gallery-dl needed)
 # ---------------------------------------------------------------------------
 
-# Magic byte signatures for valid image formats
+async def ehentai_download(gallery_url: str, output_dir: str) -> int:
+    """
+    Download all images from an e-hentai gallery into output_dir.
+    Returns the number of images successfully downloaded.
+    """
+    ua = HEADERS['User-Agent']
+    async with aiohttp.ClientSession(headers={'User-Agent': ua}) as session:
+        scraper = EHentaiScraper(session=session)
+
+        log.info("Fetching e-hentai gallery metadata...")
+        initial_data = await scraper.extract_gallery_data(gallery_url, 1)
+        if not initial_data:
+            log.error("Failed to retrieve e-hentai gallery data. Check the URL.")
+            sys.exit(1)
+
+        gallery_name = initial_data['name']
+        total_pages  = initial_data['total_pages']
+        total_images = initial_data.get('total_images', '?')
+        log.info(f"Gallery: {gallery_name} | Images: {total_images} | Pages: {total_pages}")
+
+        downloaded = 0
+        img_index  = 0
+
+        for page_num in range(1, total_pages + 1):
+            log.info(f"Processing page {page_num}/{total_pages}...")
+            page_data = await scraper.extract_gallery_data(gallery_url, page_num)
+            if not page_data:
+                log.warning(f"Could not fetch page {page_num}, skipping.")
+                continue
+
+            for image_data in page_data['image_data']:
+                image_url = image_data.get('image_url')
+                if not image_url:
+                    log.warning(f"No image URL for entry on page {page_num}, skipping.")
+                    img_index += 1
+                    continue
+
+                ext = os.path.splitext(urlparse(image_url).path)[1] or '.jpg'
+                save_path = os.path.join(output_dir, f"img_{img_index:04d}{ext}")
+
+                # Use requests (thread-safe, consistent with the rest of the pipeline)
+                success = False
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        r = requests.get(image_url, headers=HEADERS, stream=True, timeout=30)
+                        if r.status_code == 200:
+                            with open(save_path, 'wb') as f:
+                                shutil.copyfileobj(r.raw, f)
+                            success = True
+                            break
+                        else:
+                            log.warning(f"HTTP {r.status_code} for image {img_index} (attempt {attempt})")
+                    except requests.RequestException as e:
+                        log.warning(f"Download error image {img_index}: {e} (attempt {attempt})")
+                    time.sleep(2 ** attempt)
+
+                if success:
+                    downloaded += 1
+                else:
+                    log.error(f"Failed to download image {img_index} after {MAX_RETRIES} attempts.")
+                img_index += 1
+
+            await asyncio.sleep(0.5)  # rate limit between pages
+
+    return downloaded
+
+
+# ---------------------------------------------------------------------------
+# KEMONO / GENERIC DOWNLOAD
+# ---------------------------------------------------------------------------
+
 IMAGE_MAGIC = [
-    b'\xff\xd8\xff',           # JPEG
-    b'\x89PNG',                # PNG
-    b'RIFF',                   # WebP (RIFF....WEBP)
-    b'GIF8',                   # GIF
+    b'\xff\xd8\xff',   # JPEG
+    b'\x89PNG',        # PNG
+    b'RIFF',           # WebP
+    b'GIF8',           # GIF
 ]
 
 def is_valid_image_bytes(path: str) -> bool:
-    """Check file starts with a known image magic signature."""
     try:
         with open(path, 'rb') as f:
             header = f.read(12)
@@ -105,13 +193,12 @@ def get_session():
     if _session is None:
         _session = requests.Session()
         _session.headers.update(HEADERS)
-        # Carry Referer through redirects (e.g. kemono.cr → n3.kemono.cr)
         from requests import adapters
         _session.mount('https://', adapters.HTTPAdapter(max_retries=0))
     return _session
 
 def fast_download(args):
-    """Download a single URL to dest with retries, redirect-safe headers, and image validation."""
+    """Download a single URL with retries, redirect-safe headers, and image validation."""
     url, dest = args
     if os.path.exists(dest) and is_valid_image_bytes(dest):
         return dest
@@ -122,10 +209,9 @@ def fast_download(args):
                 if r.status_code == 200:
                     with open(dest, 'wb') as f:
                         shutil.copyfileobj(r.raw, f)
-                    # Validate: reject HTML error pages saved as .jpg
                     if not is_valid_image_bytes(dest):
                         os.remove(dest)
-                        log.warning(f"Invalid image content (got HTML/error?) for {url} (attempt {attempt}/{MAX_RETRIES})")
+                        log.warning(f"Invalid image content for {url} (attempt {attempt}/{MAX_RETRIES})")
                     else:
                         return dest
                 else:
@@ -133,7 +219,7 @@ def fast_download(args):
         except requests.RequestException as e:
             log.warning(f"Download error ({url}): {e} (attempt {attempt}/{MAX_RETRIES})")
         if attempt < MAX_RETRIES:
-            time.sleep(2 ** attempt)  # exponential back-off: 2s, 4s
+            time.sleep(2 ** attempt)
     log.error(f"Failed to download after {MAX_RETRIES} attempts: {url}")
     return None
 
@@ -143,24 +229,16 @@ def fast_download(args):
 # ---------------------------------------------------------------------------
 
 def process_single_image(args):
-    """
-    Resize image onto a blurred background canvas.
-    Optimised: blur the small thumbnail first, then upscale once.
-    """
+    """Resize image onto a blurred background canvas."""
     img_path, out_path = args
     try:
         with Image.open(img_path) as img:
             img = img.convert('RGB')
-
-            # Build blurred background efficiently:
-            # shrink to thumbnail → blur cheaply → upscale once
             thumb_w = 120
             thumb_h = int(thumb_w * (H / W))
             bg = img.resize((thumb_w, thumb_h), Image.Resampling.NEAREST)
             bg = bg.filter(ImageFilter.GaussianBlur(6))
             bg = bg.resize((W, H), Image.Resampling.LANCZOS)
-
-            # Fit original image inside canvas
             img.thumbnail((W, H), Image.Resampling.LANCZOS)
             offset = ((W - img.width) // 2, (H - img.height) // 2)
             bg.paste(img, offset)
@@ -183,7 +261,19 @@ def main():
     # ------------------------------------------------------------------
     # 1. DOWNLOAD / EXTRACT SOURCE IMAGES
     # ------------------------------------------------------------------
-    if url_looks_like_archive(URL):
+
+    if url_is_ehentai(URL):
+        # ── E-HENTAI: use native scraper, no gallery-dl or cookies needed ──
+        log.info("Detected e-hentai URL. Using built-in scraper...")
+        gallery_url = URL if URL.endswith('/') else URL + '/'
+        n = asyncio.run(ehentai_download(gallery_url, "workspace/extracted"))
+        if n == 0:
+            log.error("No images downloaded from e-hentai. Aborting.")
+            sys.exit(1)
+        log.info(f"Downloaded {n} images from e-hentai.")
+
+    elif url_looks_like_archive(URL):
+        # ── ARCHIVE (ZIP / RAR / 7z, including kemono .bin?f=xxx.zip) ──
         log.info("Detected archive URL. Downloading...")
         with requests.get(URL, headers=HEADERS, stream=True) as r:
             if r.status_code != 200:
@@ -198,12 +288,16 @@ def main():
         if result.returncode != 0:
             log.error(f"7z extraction failed:\n{result.stderr}")
             sys.exit(1)
+
     else:
+        # ── GALLERY (kemono post, pixiv, etc.) via gallery-dl ──
         log.info("Scraping image URLs via gallery-dl...")
-        result = subprocess.run(
-            ['gallery-dl', '-g', URL],
-            capture_output=True, text=True
-        )
+        gdl_cmd = ['gallery-dl', '-g']
+        if os.path.exists('cookies.txt'):
+            gdl_cmd += ['--cookies', 'cookies.txt']
+            log.info("Using cookies.txt for authentication.")
+        gdl_cmd.append(URL)
+        result = subprocess.run(gdl_cmd, capture_output=True, text=True)
         urls = [u.strip() for u in result.stdout.split('\n') if u.strip().startswith('http')]
         if not urls:
             log.error(
@@ -272,7 +366,7 @@ def main():
     log.info(f"Processing {len(files)} images...")
 
     # ------------------------------------------------------------------
-    # 4. PARALLEL IMAGE PROCESSING (capped thread count)
+    # 4. PARALLEL IMAGE PROCESSING
     # ------------------------------------------------------------------
     cpu_count    = os.cpu_count() or 4
     worker_count = min(cpu_count * 2, 32)
@@ -344,7 +438,6 @@ def main():
             '-c:a', 'libopus',
             '-b:a', AUDIO_BITRATE
         ]
-    # Note: intentionally NO '-c:a copy' when there is no audio track
 
     cmd.append(out_video)
 
@@ -366,7 +459,7 @@ def main():
     log.info(f"Video saved: {out_video}")
 
     # ------------------------------------------------------------------
-    # 6. POSTER FRAME (safe: use mid-point instead of hardcoded 1s)
+    # 6. POSTER FRAME
     # ------------------------------------------------------------------
     dur_result = subprocess.run(
         ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
@@ -386,7 +479,7 @@ def main():
     log.info("Poster frame saved: output/poster.jpg")
 
     # ------------------------------------------------------------------
-    # 7. CLEANUP WORKSPACE
+    # 7. CLEANUP
     # ------------------------------------------------------------------
     shutil.rmtree("workspace", ignore_errors=True)
     log.info("Workspace cleaned up.")
