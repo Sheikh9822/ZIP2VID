@@ -21,7 +21,7 @@ on:
         description: 'Seconds per image (0.33 for 3/sec, 2.5 for slow)'
         default: '0.33'
       preset:
-        description: 'SVT-AV1 Preset (10-13)'
+        description: 'SVT-AV1 Preset (0-13, lower = better quality/slower)'
         default: '12'
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
           mkdir -p ffmpeg-bin
           wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz --strip-components=2 -C ffmpeg-bin
-          
+
       - name: Setup System
         run: |
           echo "${{ github.workspace }}/ffmpeg-bin" >> $GITHUB_PATH
@@ -57,7 +57,21 @@ jobs:
           cache: 'pip'
 
       - name: Install Tools
-        run: pip install pillow requests tqdm gallery-dl yt-dlp
+        run: pip install pillow requests tqdm gallery-dl yt-dlp aiohttp aiofiles beautifulsoup4
+
+      - name: Write cookies file
+        # Writes EH_COOKIES secret to disk if set; gallery-dl picks it up automatically.
+        # To add: repo Settings → Secrets → Actions → New secret → Name: EH_COOKIES
+        # Value: paste your e-hentai cookies.txt (Netscape format, exported from browser)
+        run: |
+          if [ -n "$EH_COOKIES" ]; then
+            echo "$EH_COOKIES" > cookies.txt
+            echo "cookies.txt written"
+          else
+            echo "EH_COOKIES secret not set — skipping (non e-hentai URLs will still work)"
+          fi
+        env:
+          EH_COOKIES: ${{ secrets.EH_COOKIES }}
 
       - name: Generate Video
         env:
