@@ -47,7 +47,7 @@ RES_MAP = {
 }
 W, H = RES_MAP.get(AR_TYPE, (1920, 1080))
 
-DOWNLOAD_THREADS = 20
+DOWNLOAD_THREADS = 8   # Reduced: kemono CDN rate-limits >~10 concurrent connections
 MAX_RETRIES      = 3
 
 HEADERS = {
@@ -59,29 +59,81 @@ HEADERS = {
     'Referer': 'https://kemono.cr/'  # Fix: hotlink protection bypass
 }
 
+ARCHIVE_EXTS = ('.zip', '.rar', '.7z')
+
+def url_looks_like_archive(url: str) -> bool:
+    """
+    Detect archives even when the real filename is in the ?f= query param.
+    e.g. https://n1.kemono.cr/data/.../foo.bin?f=asuka+tanaka.zip
+    """
+    from urllib.parse import urlparse, parse_qs, unquote
+    parsed = urlparse(url)
+    # Check path first
+    if any(parsed.path.lower().endswith(e) for e in ARCHIVE_EXTS):
+        return True
+    # Check ?f= param (kemono CDN pattern)
+    f_param = parse_qs(parsed.query).get('f', [''])[0]
+    if f_param and any(unquote(f_param).lower().endswith(e) for e in ARCHIVE_EXTS):
+        return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # DOWNLOAD
 # ---------------------------------------------------------------------------
 
+# Magic byte signatures for valid image formats
+IMAGE_MAGIC = [
+    b'\xff\xd8\xff',           # JPEG
+    b'\x89PNG',                # PNG
+    b'RIFF',                   # WebP (RIFF....WEBP)
+    b'GIF8',                   # GIF
+]
+
+def is_valid_image_bytes(path: str) -> bool:
+    """Check file starts with a known image magic signature."""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(12)
+        return any(header.startswith(sig) for sig in IMAGE_MAGIC)
+    except Exception:
+        return False
+
+_session = None
+def get_session():
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update(HEADERS)
+        # Carry Referer through redirects (e.g. kemono.cr → n3.kemono.cr)
+        from requests import adapters
+        _session.mount('https://', adapters.HTTPAdapter(max_retries=0))
+    return _session
+
 def fast_download(args):
-    """Download a single URL to dest with retries and error logging."""
+    """Download a single URL to dest with retries, redirect-safe headers, and image validation."""
     url, dest = args
-    if os.path.exists(dest):
+    if os.path.exists(dest) and is_valid_image_bytes(dest):
         return dest
+    session = get_session()
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            with requests.get(url, headers=HEADERS, stream=True, timeout=20) as r:
+            with session.get(url, stream=True, timeout=30, allow_redirects=True) as r:
                 if r.status_code == 200:
                     with open(dest, 'wb') as f:
                         shutil.copyfileobj(r.raw, f)
-                    return dest
+                    # Validate: reject HTML error pages saved as .jpg
+                    if not is_valid_image_bytes(dest):
+                        os.remove(dest)
+                        log.warning(f"Invalid image content (got HTML/error?) for {url} (attempt {attempt}/{MAX_RETRIES})")
+                    else:
+                        return dest
                 else:
                     log.warning(f"HTTP {r.status_code} for {url} (attempt {attempt}/{MAX_RETRIES})")
         except requests.RequestException as e:
             log.warning(f"Download error ({url}): {e} (attempt {attempt}/{MAX_RETRIES})")
         if attempt < MAX_RETRIES:
-            time.sleep(1.5 * attempt)
+            time.sleep(2 ** attempt)  # exponential back-off: 2s, 4s
     log.error(f"Failed to download after {MAX_RETRIES} attempts: {url}")
     return None
 
@@ -131,11 +183,8 @@ def main():
     # ------------------------------------------------------------------
     # 1. DOWNLOAD / EXTRACT SOURCE IMAGES
     # ------------------------------------------------------------------
-    archive_exts = ('.zip', '.rar', '.7z')
-    base_url = URL.lower().split('?')[0]
-
-    if any(base_url.endswith(e) for e in archive_exts):
-        log.info("Downloading archive...")
+    if url_looks_like_archive(URL):
+        log.info("Detected archive URL. Downloading...")
         with requests.get(URL, headers=HEADERS, stream=True) as r:
             if r.status_code != 200:
                 log.error(f"Archive download failed with HTTP {r.status_code}")
@@ -157,7 +206,10 @@ def main():
         )
         urls = [u.strip() for u in result.stdout.split('\n') if u.strip().startswith('http')]
         if not urls:
-            log.error("gallery-dl returned no URLs. Check your FILE_URL.")
+            log.error(
+                f"gallery-dl returned no URLs. Check your FILE_URL.\n"
+                f"gallery-dl stderr:\n{result.stderr[-800:] or '(empty)'}"
+            )
             sys.exit(1)
         log.info(f"Found {len(urls)} images. Downloading with {DOWNLOAD_THREADS} threads...")
         download_tasks = [
